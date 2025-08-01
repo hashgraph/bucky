@@ -141,11 +141,9 @@ public final class S3Client implements AutoCloseable {
 
     /**
      * Closes the HTTP client.
-     *
-     * @throws Exception if an error occurs while closing the client
      */
     @Override
-    public void close() throws Exception {
+    public void close() {
         this.httpClient.close();
     }
 
@@ -202,7 +200,7 @@ public final class S3Client implements AutoCloseable {
     /**
      * Uploads a file to S3 using multipart upload, assumes the file is small enough as uses single part upload.
      *
-     * @param objectKey the key for the object in S3 (e.g., "myfolder/myfile.txt")
+     * @param objectKey the key for the object in S3 (e.g., "my_folder/my_file.txt")
      * @param storageClass the storage class (e.g., "STANDARD", "REDUCED_REDUNDANCY")
      * @param content the content of the file as a string
      * @throws S3ResponseException if a non-200 response is received from S3 during file upload
@@ -246,7 +244,7 @@ public final class S3Client implements AutoCloseable {
     /**
      * Downloads a text file from S3, assumes the file is small enough as uses single part download.
      *
-     * @param key the key for the object in S3 (e.g., "myfolder/myfile.txt"), cannot be blank
+     * @param key the key for the object in S3 (e.g., "my_folder/my_file.txt"), cannot be blank
      * @return the content of the file as a string, null if the file doesn't exist
      * @throws S3ResponseException if a non-200 response is received from S3 during file download
      * @throws IOException if an error occurs while reading the response body in case of non 200 response
@@ -278,10 +276,10 @@ public final class S3Client implements AutoCloseable {
     /**
      * Uploads a file to S3 using multipart upload.
      *
-     * @param objectKey the key for the object in S3 (e.g., "myfolder/myfile.txt"), cannot be blank
+     * @param objectKey the key for the object in S3 (e.g., "my_folder/my_file.txt"), cannot be blank
      * @param storageClass the storage class (e.g., "STANDARD", "REDUCED_REDUNDANCY"), cannot be blank
-     * @param contentIterable an Iterable of byte arrays representing the file content, cannot be null
-     * @param contentType the content type of the file (e.g., "text/plain"), cannot be blank
+     * @param contentIterable an Iterable of byte arrays representing the file content. cannot be null
+     * @param contentType the content type of the file (e.g., "text/plain"). cannot be blank
      * @throws S3ResponseException if a non-200 response is received from S3 during file upload
      * @throws IOException if an error occurs while reading the response body in case of non 200 response
      */
@@ -337,7 +335,7 @@ public final class S3Client implements AutoCloseable {
     /**
      * This method will list all multipart uploads currently active for the given
      * bucket. It will return a map of object keys and upload IDs, or an empty
-     * map if none found.
+     * map if none is found.
      *
      * @return a map of all multipart uploads in the bucket, where the key is
      * the object key and the value is a list of upload IDs, or an empty map if
@@ -347,9 +345,6 @@ public final class S3Client implements AutoCloseable {
      */
     @NonNull
     public Map<String, List<String>> listMultipartUploads() throws S3ResponseException, IOException {
-        // todo could add some query parameters to limit the number of results
-        //   also, we could add query params for prefix or maybe key-marker (to search for a specific key)
-        //   it depends on our needs as to how we will be cleaning up outstanding failed uploads (TBD)
         // build the URL for the request
         final String canonicalQueryString = "uploads=";
         // build the request URL
@@ -390,8 +385,8 @@ public final class S3Client implements AutoCloseable {
     /**
      * This method will abort a multipart upload for the specified object key.
      *
-     * @param key the object key, cannot be blank
-     * @param uploadId the upload ID for the multipart upload, cannot be blank
+     * @param key the object key. cannot be blank
+     * @param uploadId the upload ID for the multipart upload. cannot be blank
      * @throws S3ResponseException if a non-204 response is received from S3
      * @throws IOException if an error occurs while reading the response body in case of non-204 response
      */
@@ -421,9 +416,9 @@ public final class S3Client implements AutoCloseable {
     /**
      * Creates a multipart upload for the specified object key.
      *
-     * @param key The object key, cannot be null
+     * @param key The object key. Cannot be null
      * @param storageClass The storage class (e.g. "STANDARD", "REDUCED_REDUNDANCY"), nullable
-     * @param contentType The content type of the object, cannot be null
+     * @param contentType The content type of the object. Cannot be null
      * @return The upload ID for the multipart upload
      * @throws S3ResponseException if a non-200 response is received from S3
      * @throws IOException if an error occurs while reading the response body
@@ -437,8 +432,6 @@ public final class S3Client implements AutoCloseable {
         final Map<String, String> headers = new HashMap<>();
         headers.put("content-type", contentType);
         headers.put("x-amz-storage-class", storageClass);
-        // TODO add checksum algorithm and overall checksum support using x-amz-checksum-algorithm=SHA256 and
-        //  x-amz-checksum-type=COMPOSITE
         // build the request URL
         final String url = endpoint + bucketName + "/" + key + "?" + canonicalQueryString;
         // make the request
@@ -463,10 +456,10 @@ public final class S3Client implements AutoCloseable {
     /**
      * Uploads a part of a multipart upload.
      *
-     * @param key The object key, cannot be blank
-     * @param uploadId The upload ID for the multipart upload, cannot be blank
+     * @param key The object key. Cannot be blank
+     * @param uploadId The upload ID for the multipart upload. Cannot be blank
      * @param partNumber The part number (1-based)
-     * @param partData The data for the part, cannot be null
+     * @param partData The data for the part. Cannot be null
      * @return The ETag of the uploaded part
      * @throws S3ResponseException if a non-200 response is received from S3
      * @throws IOException if an error occurs while reading the response body
@@ -507,9 +500,9 @@ public final class S3Client implements AutoCloseable {
     /**
      * Completes a multipart upload.
      *
-     * @param key The object key, cannot be blank
-     * @param uploadId The upload ID for the multipart upload, cannot be blank
-     * @param eTags The list of ETags for the uploaded parts, cannot be null
+     * @param key The object key. Cannot be blank
+     * @param uploadId The upload ID for the multipart upload. Cannot be blank
+     * @param eTags The list of ETags for the uploaded parts. Cannot be null
      * @throws S3ResponseException if a non-200 response is received from S3
      * @throws IOException if an error occurs while reading the response body in case of non 200 response
      */
@@ -556,7 +549,7 @@ public final class S3Client implements AutoCloseable {
      * Performs an HTTP request to S3 to the specified URL with the given parameters.
      *
      * @param url The URL to send the request to
-     * @param httpMethod The HTTP method to use (e.g. GET, POST, PUT)
+     * @param httpMethod The HTTP method to use (e.g., GET, POST, PUT)
      * @param headers The request headers to send
      * @param requestBody The request body to send, or null if no request body is needed
      * @param bodyHandler The body handler for parsing response
@@ -605,7 +598,6 @@ public final class S3Client implements AutoCloseable {
         } catch (final IOException e) {
             throw new UncheckedIOException(e);
         } catch (final InterruptedException | URISyntaxException e) {
-            // todo what would be the correct handling for the InterruptedException?
             Thread.currentThread().interrupt();
             throw new UncheckedIOException(new IOException(e));
         }
@@ -663,7 +655,7 @@ public final class S3Client implements AutoCloseable {
      * @param endpointUrl the url to which the request is being made
      * @param httpMethod the HTTP method (GET, POST, PUT, etc.)
      * @param regionName the AWS region name
-     * @param headers The request headers; 'Host' and 'X-Amz-Date' will be added to this set
+     * @param headers The request headers, 'Host' and 'X-Amz-Date' will be added to this set
      * @param queryParameters Any query parameters that will be added to the endpoint. The parameters should be
      * specified in canonical format
      * @param bodyHash Precomputed SHA256 hash of the request body content; this value should also be set as the

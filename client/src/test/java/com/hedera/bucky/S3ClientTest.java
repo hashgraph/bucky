@@ -389,8 +389,8 @@ public class S3ClientTest {
                     .containsExactly(uploadId);
             // Abort the multipart upload
             s3Client.abortMultipartUpload(key, uploadId);
-            // Assert that the upload is removed
-            // we need to filter the map by key because MinIO client is reused
+            // Assert that the upload is removed,
+            // we need to filter the map by key because the MinIO client is reused
             final Map<String, List<String>> actualAfterAbort = s3Client.listMultipartUploads().entrySet().stream()
                     .filter(e -> e.getKey().equals(key))
                     .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
@@ -439,8 +439,8 @@ public class S3ClientTest {
 
             // Abort one multipart upload
             s3Client.abortMultipartUpload(key1, key1expected1);
-            // Assert that the upload is removed
-            // we need to filter the map by key because MinIO client is reused
+            // Assert that the upload is removed,
+            // we need to filter the map by key because the MinIO client is reused
             final Map<String, List<String>> actual = s3Client.listMultipartUploads().entrySet().stream()
                     .filter(e -> e.getKey().equals(key1) || e.getKey().equals(key2))
                     .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
