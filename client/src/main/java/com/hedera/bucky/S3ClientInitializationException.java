@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-package org.hedera.bucky;
+package com.hedera.bucky;
 
 public class S3ClientInitializationException extends S3ClientException {
     public S3ClientInitializationException() {

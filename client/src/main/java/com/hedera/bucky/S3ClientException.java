@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-package org.hedera.bucky;
+package com.hedera.bucky;
 
 /**
  * A checked exception to act as a base for all S3 client exceptions.

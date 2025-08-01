@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-package org.hedera.bucky;
+package com.hedera.bucky;
 
 import edu.umd.cs.findbugs.annotations.Nullable;
 import java.net.http.HttpHeaders;
@@ -27,7 +27,7 @@ public final class S3ResponseException extends S3ClientException {
     public S3ResponseException(
             final int responseStatusCode,
             @Nullable final byte[] responseBody,
-            @Nullable final HttpHeaders responseHeaders) {
+            @Nullable @SuppressWarnings("exports") final HttpHeaders responseHeaders) {
         super();
         this.responseStatusCode = responseStatusCode;
         this.responseBody = responseBody;
@@ -37,7 +37,7 @@ public final class S3ResponseException extends S3ClientException {
     public S3ResponseException(
             final int responseStatusCode,
             @Nullable final byte[] responseBody,
-            @Nullable final HttpHeaders responseHeaders,
+            @Nullable @SuppressWarnings("exports") final HttpHeaders responseHeaders,
             final String message) {
         super(message);
         this.responseStatusCode = responseStatusCode;
@@ -48,7 +48,7 @@ public final class S3ResponseException extends S3ClientException {
     public S3ResponseException(
             final int responseStatusCode,
             @Nullable final byte[] responseBody,
-            @Nullable final HttpHeaders responseHeaders,
+            @Nullable @SuppressWarnings("exports") final HttpHeaders responseHeaders,
             final Throwable cause) {
         super(cause);
         this.responseStatusCode = responseStatusCode;
@@ -59,7 +59,7 @@ public final class S3ResponseException extends S3ClientException {
     public S3ResponseException(
             final int responseStatusCode,
             @Nullable final byte[] responseBody,
-            @Nullable final HttpHeaders responseHeaders,
+            @Nullable @SuppressWarnings("exports") final HttpHeaders responseHeaders,
             final String message,
             final Throwable cause) {
         super(message, cause);
@@ -76,6 +76,7 @@ public final class S3ResponseException extends S3ClientException {
         return responseBody;
     }
 
+    @SuppressWarnings("exports")
     public HttpHeaders getResponseHeaders() {
         return responseHeaders;
     }

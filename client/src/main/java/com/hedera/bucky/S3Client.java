@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-package org.hedera.bucky;
+package com.hedera.bucky;
 
+import com.hedera.bucky.utils.Preconditions;
+import com.hedera.bucky.utils.StringUtilities;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import java.io.IOException;
 import java.io.InputStream;
@@ -40,8 +42,6 @@ import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import javax.xml.XMLConstants;
 import javax.xml.parsers.DocumentBuilderFactory;
-import org.hiero.block.common.utils.Preconditions;
-import org.hiero.block.common.utils.StringUtilities;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.NodeList;
@@ -595,7 +595,8 @@ public final class S3Client implements AutoCloseable {
                 case PUT -> requestBuilder.PUT(HttpRequest.BodyPublishers.ofByteArray(requestBody));
                 case GET -> requestBuilder.GET();
                 case DELETE -> requestBuilder.DELETE();
-                default -> throw new IllegalArgumentException("Unsupported HTTP method: " + httpMethod);};
+                default -> throw new IllegalArgumentException("Unsupported HTTP method: " + httpMethod);
+            };
             requestBuilder = requestBuilder.headers(localHeaders.entrySet().stream()
                     .flatMap(entry -> Stream.of(entry.getKey(), entry.getValue()))
                     .toArray(String[]::new));
