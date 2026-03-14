@@ -655,7 +655,8 @@ public class S3ClientTest {
         }
         // Verify the object was stored under the correct (unencoded) key via MinIO
         final byte[] actual = minioClient
-                .getObject(GetObjectArgs.builder().bucket(BUCKET_NAME).object(key).build())
+                .getObject(
+                        GetObjectArgs.builder().bucket(BUCKET_NAME).object(key).build())
                 .readAllBytes();
         assertThat(new String(actual, StandardCharsets.UTF_8)).isEqualTo(content);
     }
