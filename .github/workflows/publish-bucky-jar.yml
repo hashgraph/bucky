@@ -1,13 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 name: publish-bucky-jar.yml
 on:
-  # Manual trigger with custom release tag
+  # Manual trigger — version is read from version.txt on the checked-out branch
   workflow_dispatch:
     inputs:
-      version:
-        description: "Release tag:"
-        type: string
-        required: true
       dry-run-enabled:
         description: "Perform Dry Run"
         type: boolean
@@ -80,17 +76,11 @@ jobs:
       - name: Build
         run: ${GRADLE_EXEC} clean assemble
 
-      - name: Extract version
-        id: extract_version
-        run: |
-          VERSION=$(cat version.txt)
-          echo "VERSION=${VERSION}" >> $GITHUB_ENV
-
       - name: Publish jar to Maven Central
         if: "${{ github.event_name != 'workflow_dispatch' || github.event.inputs.dry-run-enabled == 'false' }}"
         env:
           NEXUS_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
           NEXUS_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
-        # If VERSION is *-SNAPSHOT the publishing directs to Maven Central Snapshots, otherwise to Maven Central
+        # Gradle reads version.txt; a -SNAPSHOT version publishes to Maven Central Snapshots, otherwise to Maven Central
         run: ./gradlew publishAggregationToCentralPortal -PpublishSigningEnabled=true
 
