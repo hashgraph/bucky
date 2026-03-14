@@ -13,7 +13,7 @@ dependencies {
 }
 
 val log4j = "2.25.3"
-    val junit5 = "6.0.3"
+val junit5 = "6.0.3"
 val testContainers = "1.21.4"
 
 dependencies.constraints {
