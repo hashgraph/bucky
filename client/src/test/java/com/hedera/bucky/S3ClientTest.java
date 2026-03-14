@@ -551,8 +551,7 @@ public class S3ClientTest {
             assertThatThrownBy(() -> s3Client.downloadTextFile(""))
                     .isInstanceOf(IllegalArgumentException.class);
             assertThatThrownBy(() -> s3Client.downloadTextFile("   "))
-                    .isInstanceOf(IllegalArgumentException.class);
-        }
+                    .isInstanceOf(IllegalArgumentException.class);        }
     }
 
     /**
