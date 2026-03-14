@@ -637,6 +637,43 @@ public class S3ClientTest {
     }
 
     /**
+     * Verifies that {@link S3Client#uploadFile} aborts the multipart upload when
+     * the content iterator throws an exception mid-stream, so no dangling upload
+     * ID is left in S3.
+     *
+     * <p>Without the fix, the upload ID created by {@code createMultipartUpload}
+     * would remain in {@code listMultipartUploads()} indefinitely after the failure.
+     */
+    @Test
+    @DisplayName("uploadFile() aborts the multipart upload when the iterator throws, leaving no dangling upload ID")
+    void testUploadFileAbortsMultipartUploadOnFailure() throws Exception {
+        final String key = "testUploadFileAbortOnFailure.txt";
+        // Iterator that always reports hasNext=true but throws on next() — this
+        // ensures createMultipartUpload() is called before the failure occurs.
+        final Iterator<byte[]> failingIterator = new Iterator<>() {
+            @Override
+            public boolean hasNext() {
+                return true;
+            }
+
+            @Override
+            public byte[] next() {
+                throw new RuntimeException("Simulated content failure");
+            }
+        };
+        try (final S3Client s3Client = client()) {
+            // Verify no pre-existing uploads for this key
+            assertThat(s3Client.listMultipartUploads()).doesNotContainKey(key);
+            // The upload must propagate the original exception
+            assertThatThrownBy(() -> s3Client.uploadFile(key, "STANDARD", failingIterator, "text/plain"))
+                    .isInstanceOf(RuntimeException.class)
+                    .hasMessage("Simulated content failure");
+            // The multipart upload must have been aborted — no dangling ID
+            assertThat(s3Client.listMultipartUploads()).doesNotContainKey(key);
+        }
+    }
+
+    /**
      * This method will create a new instance of the {@link S3Client} to test.
      */
     private S3Client client() throws S3ClientInitializationException {
