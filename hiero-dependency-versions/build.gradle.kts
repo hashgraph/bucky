@@ -36,6 +36,7 @@ dependencies.constraints {
     api("org.testcontainers:testcontainers:$testContainers") { because("org.testcontainers") }
 
     api("io.minio:minio:8.6.0") { because("io.minio") }
+    api("com.squareup.okhttp3:okhttp:5.3.2") { because("com.squareup.okhttp3") }
 
     api("com.google.guava:guava:33.5.0-jre") { because("com.google.common") }
 }
