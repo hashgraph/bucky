@@ -83,4 +83,3 @@ jobs:
           NEXUS_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
         # Gradle reads version.txt; a -SNAPSHOT version publishes to Maven Central Snapshots, otherwise to Maven Central
         run: ./gradlew publishAggregationToCentralPortal -PpublishSigningEnabled=true
-
