@@ -291,45 +291,59 @@ public final class S3Client implements AutoCloseable {
             throws S3ResponseException, IOException {
         // start the multipart upload
         final String uploadId = createMultipartUpload(objectKey, storageClass, contentType);
-        // create a list to store the ETags of the uploaded parts
-        final List<String> eTags = new ArrayList<>();
-        // Multipart upload works in chunks of 5MB
-        final byte[] chunk = new byte[5 * 1024 * 1024];
-        // track the offset in the chunk
-        int offsetInChunk = 0;
-        // We need to iterate of the contentIterable and build 5MB chunks that we can upload
-        // to S3. We will use System.arrayCopy() to build the chunks.
-        while (contentIterable.hasNext()) {
-            final byte[] next = contentIterable.next();
-            int remainingContent = next.length;
-            while (remainingContent > 0) {
-                // if the remaining content is larger than the chunk size, we need to split it
-                if (remainingContent > chunk.length - offsetInChunk) {
-                    int length = chunk.length - offsetInChunk;
-                    System.arraycopy(next, next.length - remainingContent, chunk, offsetInChunk, length);
-                    remainingContent -= length;
-                    // we now have a full chunk so need to upload the chunk to S3
-                    eTags.add(multipartUploadPart(objectKey, uploadId, eTags.size() + 1, chunk));
-                    // reset the offset in the chunk
-                    offsetInChunk = 0;
-                } else {
-                    // we have a partial chunk so need to copy the remaining content to the chunk
-                    System.arraycopy(next, next.length - remainingContent, chunk, offsetInChunk, remainingContent);
-                    offsetInChunk += remainingContent;
-                    remainingContent = 0;
+        try {
+            // create a list to store the ETags of the uploaded parts
+            final List<String> eTags = new ArrayList<>();
+            // Multipart upload works in chunks of 5MB
+            final byte[] chunk = new byte[5 * 1024 * 1024];
+            // track the offset in the chunk
+            int offsetInChunk = 0;
+            // We need to iterate of the contentIterable and build 5MB chunks that we can upload
+            // to S3. We will use System.arrayCopy() to build the chunks.
+            while (contentIterable.hasNext()) {
+                final byte[] next = contentIterable.next();
+                int remainingContent = next.length;
+                while (remainingContent > 0) {
+                    // if the remaining content is larger than the chunk size, we need to split it
+                    if (remainingContent > chunk.length - offsetInChunk) {
+                        int length = chunk.length - offsetInChunk;
+                        System.arraycopy(next, next.length - remainingContent, chunk, offsetInChunk, length);
+                        remainingContent -= length;
+                        // we now have a full chunk so need to upload the chunk to S3
+                        eTags.add(multipartUploadPart(objectKey, uploadId, eTags.size() + 1, chunk));
+                        // reset the offset in the chunk
+                        offsetInChunk = 0;
+                    } else {
+                        // we have a partial chunk so need to copy the remaining content to the chunk
+                        System.arraycopy(next, next.length - remainingContent, chunk, offsetInChunk, remainingContent);
+                        offsetInChunk += remainingContent;
+                        remainingContent = 0;
+                    }
                 }
             }
+            // now upload the last chunk if it is not empty
+            if (offsetInChunk > 0) {
+                // extract just the content of the chunk
+                byte[] lastChunk = new byte[offsetInChunk];
+                System.arraycopy(chunk, 0, lastChunk, 0, offsetInChunk);
+                // we have a partial chunk so need to upload it to S3
+                eTags.add(multipartUploadPart(objectKey, uploadId, eTags.size() + 1, lastChunk));
+            }
+            // Complete the multipart upload
+            completeMultipartUpload(objectKey, uploadId, eTags);
+        } catch (final Exception e) {
+            // Abort the multipart upload to avoid leaking incomplete uploads in S3,
+            // which would otherwise persist and accrue storage charges until manually aborted.
+            try {
+                abortMultipartUpload(objectKey, uploadId);
+            } catch (final Exception abortEx) {
+                e.addSuppressed(abortEx);
+            }
+            if (e instanceof S3ResponseException sre) throw sre;
+            if (e instanceof IOException ioe) throw ioe;
+            if (e instanceof RuntimeException rte) throw rte;
+            throw new IOException(e); // unreachable — satisfies compiler
         }
-        // now upload the last chunk if it is not empty
-        if (offsetInChunk > 0) {
-            // extract just the content of the chunk
-            byte[] lastChunk = new byte[offsetInChunk];
-            System.arraycopy(chunk, 0, lastChunk, 0, offsetInChunk);
-            // we have a partial chunk so need to upload it to S3
-            eTags.add(multipartUploadPart(objectKey, uploadId, eTags.size() + 1, lastChunk));
-        }
-        // Complete the multipart upload
-        completeMultipartUpload(objectKey, uploadId, eTags);
     }
 
     /**
