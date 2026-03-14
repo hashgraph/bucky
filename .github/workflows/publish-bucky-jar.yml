@@ -24,7 +24,7 @@ env:
   PACKAGE_NAME: hedera-bucky
   GRADLE_EXEC: "ionice -c 2 -n 2 nice -n 19 ./gradlew "
   JAVA_DISTRIBUTION: "temurin"
-  JAVA_VERSION: "21.0.7"
+  JAVA_VERSION: "25.0.2"
   DOCKER_MIRROR: "https://hub.mirror.docker.lat.ope.eng.hashgraph.io"
   BUILDKIT_VERSION: "v0.22.0"
 
