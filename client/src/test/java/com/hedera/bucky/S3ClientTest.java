@@ -2,6 +2,7 @@
 package com.hedera.bucky;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -459,6 +460,187 @@ public class S3ClientTest {
     void testFetchNonExistentObject() throws Exception {
         try (final S3Client s3Client = client()) {
             assertNull(s3Client.downloadTextFile("non-existent-object.txt"));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Constructor — precondition validation (no network calls required)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that the {@link S3Client} constructor throws
+     * {@link S3ClientInitializationException} when any required parameter is
+     * blank or null. Each parameter is exercised in isolation.
+     */
+    @Test
+    @DisplayName("Constructor throws S3ClientInitializationException for blank or null parameters")
+    void testConstructorRejectsBlankOrNullParameters() {
+        assertThatThrownBy(() -> new S3Client(null, endpoint, BUCKET_NAME, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD))
+                .isInstanceOf(S3ClientInitializationException.class);
+        assertThatThrownBy(() -> new S3Client("", endpoint, BUCKET_NAME, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD))
+                .isInstanceOf(S3ClientInitializationException.class);
+        assertThatThrownBy(() -> new S3Client(REGION_NAME, null, BUCKET_NAME, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD))
+                .isInstanceOf(S3ClientInitializationException.class);
+        assertThatThrownBy(() -> new S3Client(REGION_NAME, "", BUCKET_NAME, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD))
+                .isInstanceOf(S3ClientInitializationException.class);
+        assertThatThrownBy(() -> new S3Client(REGION_NAME, endpoint, null, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD))
+                .isInstanceOf(S3ClientInitializationException.class);
+        assertThatThrownBy(() -> new S3Client(REGION_NAME, endpoint, "", MINIO_ROOT_USER, MINIO_ROOT_PASSWORD))
+                .isInstanceOf(S3ClientInitializationException.class);
+        assertThatThrownBy(() -> new S3Client(REGION_NAME, endpoint, BUCKET_NAME, null, MINIO_ROOT_PASSWORD))
+                .isInstanceOf(S3ClientInitializationException.class);
+        assertThatThrownBy(() -> new S3Client(REGION_NAME, endpoint, BUCKET_NAME, "", MINIO_ROOT_PASSWORD))
+                .isInstanceOf(S3ClientInitializationException.class);
+        assertThatThrownBy(() -> new S3Client(REGION_NAME, endpoint, BUCKET_NAME, MINIO_ROOT_USER, null))
+                .isInstanceOf(S3ClientInitializationException.class);
+        assertThatThrownBy(() -> new S3Client(REGION_NAME, endpoint, BUCKET_NAME, MINIO_ROOT_USER, ""))
+                .isInstanceOf(S3ClientInitializationException.class);
+    }
+
+    // -----------------------------------------------------------------------
+    // listObjects — input validation (no network calls required)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#listObjects(String, int)} throws
+     * {@link IllegalArgumentException} when {@code maxResults} is outside the
+     * allowed range of [1, 1000].
+     */
+    @Test
+    @DisplayName("listObjects() throws IllegalArgumentException for maxResults out of range [1, 1000]")
+    void testListObjectsRejectsOutOfRangeMaxResults() throws S3ClientInitializationException {
+        try (final S3Client s3Client = client()) {
+            assertThatThrownBy(() -> s3Client.listObjects("prefix", 0))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.listObjects("prefix", 1001))
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // uploadTextFile / downloadTextFile / abortMultipartUpload — input validation
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#uploadTextFile(String, String, String)}
+     * throws {@link IllegalArgumentException} for each blank parameter.
+     */
+    @Test
+    @DisplayName("uploadTextFile() throws IllegalArgumentException for blank parameters")
+    void testUploadTextFileRejectsBlankParameters() throws S3ClientInitializationException {
+        try (final S3Client s3Client = client()) {
+            assertThatThrownBy(() -> s3Client.uploadTextFile("", "STANDARD", "content"))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.uploadTextFile("  ", "STANDARD", "content"))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.uploadTextFile("key", "", "content"))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.uploadTextFile("key", "STANDARD", ""))
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    /**
+     * Verifies that {@link S3Client#downloadTextFile(String)} throws
+     * {@link IllegalArgumentException} for a blank key.
+     */
+    @Test
+    @DisplayName("downloadTextFile() throws IllegalArgumentException for a blank key")
+    void testDownloadTextFileRejectsBlankKey() throws S3ClientInitializationException {
+        try (final S3Client s3Client = client()) {
+            assertThatThrownBy(() -> s3Client.downloadTextFile(""))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.downloadTextFile("   "))
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    /**
+     * Verifies that {@link S3Client#abortMultipartUpload(String, String)}
+     * throws {@link IllegalArgumentException} for a blank key or upload ID.
+     */
+    @Test
+    @DisplayName("abortMultipartUpload() throws IllegalArgumentException for blank key or uploadId")
+    void testAbortMultipartUploadRejectsBlankParameters() throws S3ClientInitializationException {
+        try (final S3Client s3Client = client()) {
+            assertThatThrownBy(() -> s3Client.abortMultipartUpload("", "some-upload-id"))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.abortMultipartUpload("some-key", ""))
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // listObjects — boundary and integration
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#listObjects(String, int)} respects
+     * {@code maxResults=1} (the lower boundary of the allowed range) and
+     * returns at most one result even when more objects exist.
+     */
+    @Test
+    @DisplayName("listObjects() with maxResults=1 returns exactly one result")
+    void testListObjectsWithMaxResultsOne() throws Exception {
+        final String keyPrefix = "boundary-one-";
+        final String content = "boundary test";
+        // Upload two objects with the same prefix
+        for (int i = 0; i < 2; i++) {
+            final String key = keyPrefix + i + ".txt";
+            minioClient.putObject(PutObjectArgs.builder()
+                    .bucket(BUCKET_NAME)
+                    .object(key)
+                    .stream(new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8)), content.length(), -1)
+                    .build());
+        }
+        try (final S3Client s3Client = client()) {
+            final List<String> actual = s3Client.listObjects(keyPrefix, 1);
+            assertThat(actual).hasSize(1);
+        }
+    }
+
+    /**
+     * Verifies that {@link S3Client#listObjects(String, int)} with an empty
+     * prefix returns all objects in the bucket.
+     */
+    @Test
+    @DisplayName("listObjects() with empty prefix returns all objects in the bucket")
+    void testListObjectsWithEmptyPrefixReturnsAllObjects() throws Exception {
+        final String keyPrefix = "empty-prefix-test-";
+        final String content = "empty prefix content";
+        final List<String> uploaded = List.of(keyPrefix + "a.txt", keyPrefix + "b.txt");
+        for (final String key : uploaded) {
+            minioClient.putObject(PutObjectArgs.builder()
+                    .bucket(BUCKET_NAME)
+                    .object(key)
+                    .stream(new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8)), content.length(), -1)
+                    .build());
+        }
+        try (final S3Client s3Client = client()) {
+            final List<String> all = s3Client.listObjects("", 1000);
+            assertThat(all).containsAll(uploaded);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Path-style keys (keys containing forward slashes)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#uploadTextFile(String, String, String)}
+     * and {@link S3Client#downloadTextFile(String)} work correctly when the
+     * object key contains forward slashes, representing a virtual directory
+     * path.
+     */
+    @Test
+    @DisplayName("uploadTextFile() and downloadTextFile() handle path-style keys with forward slashes")
+    void testUploadAndDownloadTextFileWithPathStyleKey() throws Exception {
+        final String key = "folder/subfolder/path-style-file.txt";
+        final String expected = "content in a nested path";
+        try (final S3Client s3Client = client()) {
+            assertDoesNotThrow(() -> s3Client.uploadTextFile(key, "STANDARD", expected));
+            final String actual = s3Client.downloadTextFile(key);
+            assertThat(actual).isEqualTo(expected);
         }
     }
 
