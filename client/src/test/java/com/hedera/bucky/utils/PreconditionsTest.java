@@ -19,14 +19,10 @@ class PreconditionsTest {
     @Test
     @DisplayName("requireNotBlank throws IllegalArgumentException for null, empty, and whitespace-only strings")
     void requireNotBlankThrowsForBlankInputs() {
-        assertThatThrownBy(() -> Preconditions.requireNotBlank(null))
-                .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> Preconditions.requireNotBlank(""))
-                .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> Preconditions.requireNotBlank("   "))
-                .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> Preconditions.requireNotBlank("\t"))
-                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> Preconditions.requireNotBlank(null)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> Preconditions.requireNotBlank("")).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> Preconditions.requireNotBlank("   ")).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> Preconditions.requireNotBlank("\t")).isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
