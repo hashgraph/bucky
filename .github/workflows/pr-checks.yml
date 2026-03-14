@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: Apache-2.0
+name: "PR Checks"
+on:
+  push:
+    branches:
+      - main
+      - release/*
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GRADLE_EXEC: "ionice -c 2 -n 2 nice -n 19 ./gradlew "
+
+permissions:
+  id-token: write
+  contents: read
+  packages: write
+
+jobs:
+  compile:
+    timeout-minutes: 20
+    name: "Quality Checks and UTs"
+    runs-on: bucky-linux-medium
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@58077d3c7e43986b6b15fba718e8ea69e387dfcc # v2.15.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Expand Shallow Clone for Spotless
+        run: |
+          if [ -f .git/shallow ]; then
+            git fetch --unshallow --no-recurse-submodules
+          else
+            echo "Repository is not shallow, no need to unshallow."
+          fi
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: "temurin"
+          java-version: "25.0.2"
+
+      - name: Build
+        id: gradle-build
+        run: ${GRADLE_EXEC} clean assemble
+
+      - name: Style Check
+        id: spotless-check
+        run: ${GRADLE_EXEC} qualityCheck --continue
+
+      - name: Unit Tests
+        id: unit-tests
+        run: ${GRADLE_EXEC} check
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5.5.2
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: gradle/aggregation/build/reports/jacoco/testCodeCoverageReport/testCodeCoverageReport.xml
