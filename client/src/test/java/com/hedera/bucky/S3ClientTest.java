@@ -510,10 +510,8 @@ public class S3ClientTest {
     @DisplayName("listObjects() throws IllegalArgumentException for maxResults out of range [1, 1000]")
     void testListObjectsRejectsOutOfRangeMaxResults() throws S3ClientInitializationException {
         try (final S3Client s3Client = client()) {
-            assertThatThrownBy(() -> s3Client.listObjects("prefix", 0))
-                    .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> s3Client.listObjects("prefix", 1001))
-                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.listObjects("prefix", 0)).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.listObjects("prefix", 1001)).isInstanceOf(IllegalArgumentException.class);
         }
     }
 
@@ -548,10 +546,8 @@ public class S3ClientTest {
     @DisplayName("downloadTextFile() throws IllegalArgumentException for a blank key")
     void testDownloadTextFileRejectsBlankKey() throws S3ClientInitializationException {
         try (final S3Client s3Client = client()) {
-            assertThatThrownBy(() -> s3Client.downloadTextFile(""))
-                    .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> s3Client.downloadTextFile("   "))
-                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.downloadTextFile("")).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.downloadTextFile("   ")).isInstanceOf(IllegalArgumentException.class);
         }
     }
 
@@ -587,10 +583,8 @@ public class S3ClientTest {
         // Upload two objects with the same prefix
         for (int i = 0; i < 2; i++) {
             final String key = keyPrefix + i + ".txt";
-            minioClient.putObject(PutObjectArgs.builder()
-                    .bucket(BUCKET_NAME)
-                    .object(key)
-                    .stream(new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8)), content.length(), -1)
+            minioClient.putObject(PutObjectArgs.builder().bucket(BUCKET_NAME).object(key).stream(
+                            new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8)), content.length(), -1)
                     .build());
         }
         try (final S3Client s3Client = client()) {
@@ -610,10 +604,8 @@ public class S3ClientTest {
         final String content = "empty prefix content";
         final List<String> uploaded = List.of(keyPrefix + "a.txt", keyPrefix + "b.txt");
         for (final String key : uploaded) {
-            minioClient.putObject(PutObjectArgs.builder()
-                    .bucket(BUCKET_NAME)
-                    .object(key)
-                    .stream(new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8)), content.length(), -1)
+            minioClient.putObject(PutObjectArgs.builder().bucket(BUCKET_NAME).object(key).stream(
+                            new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8)), content.length(), -1)
                     .build());
         }
         try (final S3Client s3Client = client()) {
