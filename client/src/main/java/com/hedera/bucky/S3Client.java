@@ -339,10 +339,12 @@ public final class S3Client implements AutoCloseable {
             } catch (final Exception abortEx) {
                 e.addSuppressed(abortEx);
             }
-            if (e instanceof S3ResponseException sre) throw sre;
-            if (e instanceof IOException ioe) throw ioe;
-            if (e instanceof RuntimeException rte) throw rte;
-            throw new IOException(e); // unreachable — satisfies compiler
+
+            switch (e) {
+                case S3ResponseException sre -> throw sre;
+                case IOException ioe -> throw ioe;
+                default -> throw new RuntimeException(e);
+            }
         }
     }
 
