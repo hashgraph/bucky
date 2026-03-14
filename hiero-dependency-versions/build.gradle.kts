@@ -17,7 +17,7 @@ val junit5 = "6.0.3"
 val testContainers = "1.21.4"
 
 dependencies.constraints {
-    api("com.squareup.okio:okio-jvm:3.17.0") { because("okio") }
+    api("com.squareup.okio:okio-jvm:3.17.0") { because("com.squareup.okio") }
     api("org.jetbrains:annotations:26.1.0") { because("org.jetbrains.annotations") }
 
     api("org.apache.logging.log4j:log4j-slf4j2-impl:$log4j") {
