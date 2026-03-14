@@ -654,22 +654,16 @@ public class S3ClientTest {
         final String content = "prefix encoding test";
         // Upload objects that should match and one that should not
         for (final String key : expected) {
-            minioClient.putObject(PutObjectArgs.builder()
-                    .bucket(BUCKET_NAME)
-                    .object(key)
-                    .stream(new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8)), content.length(), -1)
+            minioClient.putObject(PutObjectArgs.builder().bucket(BUCKET_NAME).object(key).stream(
+                            new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8)), content.length(), -1)
                     .build());
         }
-        minioClient.putObject(PutObjectArgs.builder()
-                .bucket(BUCKET_NAME)
-                .object(unrelatedKey)
-                .stream(new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8)), content.length(), -1)
+        minioClient.putObject(PutObjectArgs.builder().bucket(BUCKET_NAME).object(unrelatedKey).stream(
+                        new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8)), content.length(), -1)
                 .build());
         try (final S3Client s3Client = client()) {
             final List<String> actual = s3Client.listObjects(prefix, 100);
-            assertThat(actual)
-                    .containsExactlyInAnyOrderElementsOf(expected)
-                    .doesNotContain(unrelatedKey);
+            assertThat(actual).containsExactlyInAnyOrderElementsOf(expected).doesNotContain(unrelatedKey);
         }
     }
 
