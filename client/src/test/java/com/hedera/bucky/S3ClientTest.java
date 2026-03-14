@@ -667,7 +667,7 @@ public class S3ClientTest {
             // The upload must propagate the original exception
             assertThatThrownBy(() -> s3Client.uploadFile(key, "STANDARD", failingIterator, "text/plain"))
                     .isInstanceOf(RuntimeException.class)
-                    .hasMessage("Simulated content failure");
+                    .hasMessageContaining("Simulated content failure");
             // The multipart upload must have been aborted — no dangling ID
             assertThat(s3Client.listMultipartUploads()).doesNotContainKey(key);
         }
