@@ -397,7 +397,7 @@ public final class S3Client implements AutoCloseable {
         // build the canonical query string
         final String canonicalQueryString = "uploadId=" + uploadId;
         // build the request URL
-        final String url = endpoint + bucketName + "/" + key + "?" + canonicalQueryString;
+        final String url = endpoint + bucketName + "/" + urlEncode(key, true) + "?" + canonicalQueryString;
         // make the request
         final HttpResponse<InputStream> response =
                 request(url, DELETE, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
@@ -433,7 +433,7 @@ public final class S3Client implements AutoCloseable {
         headers.put("content-type", contentType);
         headers.put("x-amz-storage-class", storageClass);
         // build the request URL
-        final String url = endpoint + bucketName + "/" + key + "?" + canonicalQueryString;
+        final String url = endpoint + bucketName + "/" + urlEncode(key, true) + "?" + canonicalQueryString;
         // make the request
         final HttpResponse<InputStream> response = request(url, POST, headers, null, BodyHandlers.ofInputStream());
         // parse the response body as XML and check status
@@ -478,7 +478,7 @@ public final class S3Client implements AutoCloseable {
         headers.put("content-type", "application/octet-stream");
         headers.put("x-amz-content-sha256", base64(sha256(partData)));
         // build the URL for the request
-        final String url = endpoint + bucketName + "/" + key + "?" + canonicalQueryString;
+        final String url = endpoint + bucketName + "/" + urlEncode(key, true) + "?" + canonicalQueryString;
         // make the request
         final HttpResponse<InputStream> response = request(url, PUT, headers, partData, BodyHandlers.ofInputStream());
         // check status code
@@ -527,7 +527,7 @@ public final class S3Client implements AutoCloseable {
         sb.append("</CompleteMultipartUpload>");
         final byte[] requestBody = sb.toString().getBytes(StandardCharsets.UTF_8);
         // build the request URL
-        final String url = endpoint + bucketName + "/" + key + "?" + canonicalQueryString;
+        final String url = endpoint + bucketName + "/" + urlEncode(key, true) + "?" + canonicalQueryString;
         // make the request
         final HttpResponse<InputStream> response =
                 request(url, POST, headers, requestBody, BodyHandlers.ofInputStream());
