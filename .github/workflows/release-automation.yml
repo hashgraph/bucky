@@ -45,9 +45,12 @@ jobs:
 
       - name: Set Release Environment Variables
         run: |
-          PREMINOR_VERSION=${{ steps.version_parser.outputs.inc-preminor }}
-          NEXT_VERSION_SNAPSHOT=${PREMINOR_VERSION//-0/-SNAPSHOT}
-          RELEASE_BRANCH="release/${{ steps.version_parser.outputs.major }}.${{ steps.version_parser.outputs.minor }}"
+          # explicit construction avoids issues with inc-preminor when version isn't conventional e.g. 1.2.0-alpha.0
+          MAJOR=${{ steps.version_parser.outputs.major }}
+          MINOR=${{ steps.version_parser.outputs.minor }}
+          NEXT_MINOR=$(( MINOR + 1 ))
+          NEXT_VERSION_SNAPSHOT="${MAJOR}.${NEXT_MINOR}.0-SNAPSHOT"
+          RELEASE_BRANCH="release/${MAJOR}.${MINOR}"
           [[ -z "${{ steps.version_parser.outputs.prerelease }}" ]] && \
             VERSION=${{ steps.version_parser.outputs.release }} || \
             VERSION="${{ steps.version_parser.outputs.release }}-${{ steps.version_parser.outputs.prerelease }}"
