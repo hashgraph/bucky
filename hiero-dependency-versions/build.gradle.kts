@@ -12,14 +12,13 @@ dependencies {
     }
 }
 
-val log4j = "2.25.0"
+val log4j = "2.25.3"
 val junit5 = "6.0.3"
-val mockito = "5.18.0"
 val testContainers = "1.21.4"
 
 dependencies.constraints {
-    api("com.squareup.okio:okio-jvm:3.16.4") { because("com.squareup.okio") }
-    api("org.jetbrains:annotations:26.0.2") { because("org.jetbrains.annotations") }
+    api("com.squareup.okio:okio-jvm:3.17.0") { because("com.squareup.okio") }
+    api("org.jetbrains:annotations:26.1.0") { because("org.jetbrains.annotations") }
 
     api("org.apache.logging.log4j:log4j-slf4j2-impl:$log4j") {
         because("org.apache.logging.log4j.slf4j2.impl")
@@ -36,7 +35,8 @@ dependencies.constraints {
 
     api("org.testcontainers:testcontainers:$testContainers") { because("org.testcontainers") }
 
-    api("io.minio:minio:8.5.17") { because("io.minio") }
+    api("io.minio:minio:8.6.0") { because("io.minio") }
+    api("com.squareup.okhttp3:okhttp:5.3.2") { because("com.squareup.okhttp3") }
 
     api("com.google.guava:guava:33.5.0-jre") { because("com.google.common") }
 }

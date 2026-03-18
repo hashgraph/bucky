@@ -1,0 +1,202 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Release Automation
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version (semver)"
+        required: true
+
+permissions:
+  contents: write
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    timeout-minutes: 15
+    name: Release
+    runs-on: bucky-linux-medium
+    env:
+      JAVA_DISTRIBUTION: "temurin"
+      JAVA_VERSION: "25.0.2"
+    outputs:
+      create_pr: ${{ env.CREATE_PR }}
+      next_version_snapshot: ${{ env.NEXT_VERSION_SNAPSHOT }}
+      pr_title: ${{ env.PR_TITLE }}
+      release_branch: ${{ env.RELEASE_BRANCH }}
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@58077d3c7e43986b6b15fba718e8ea69e387dfcc # v2.15.1
+        with:
+          egress-policy: audit
+
+      - name: Parse Version
+        id: version_parser
+        uses: step-security/semver-utils@4ae9c1fd6d1c5f8f152fe7e2efe8069a952c2ace # v4.3.2
+        with:
+          lenient: false
+          version: ${{ github.event.inputs.version }}
+
+      - name: Set Release Environment Variables
+        run: |
+          # explicit construction avoids issues with inc-preminor when version isn't conventional e.g. 1.2.0-alpha.0
+          MAJOR=${{ steps.version_parser.outputs.major }}
+          MINOR=${{ steps.version_parser.outputs.minor }}
+          NEXT_MINOR=$(( MINOR + 1 ))
+          NEXT_VERSION_SNAPSHOT="${MAJOR}.${NEXT_MINOR}.0-SNAPSHOT"
+          RELEASE_BRANCH="release/${MAJOR}.${MINOR}"
+          [[ -z "${{ steps.version_parser.outputs.prerelease }}" ]] && \
+            VERSION=${{ steps.version_parser.outputs.release }} || \
+            VERSION="${{ steps.version_parser.outputs.release }}-${{ steps.version_parser.outputs.prerelease }}"
+          RELEASE_TAG="v${VERSION}"
+
+          cat >> $GITHUB_ENV <<EOF
+          NEXT_VERSION_SNAPSHOT=$NEXT_VERSION_SNAPSHOT
+          RELEASE_BRANCH=$RELEASE_BRANCH
+          RELEASE_TAG=$RELEASE_TAG
+          VERSION=$VERSION
+          EOF
+
+      - name: Checkout Repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_ACCESS_TOKEN }}
+          persist-credentials: "true"
+
+      - name: Import GPG Key
+        id: gpg_importer
+        uses: step-security/ghaction-import-gpg@69c854a83c7f79463f8bdf46772ab09826c560cd # v6.3.1
+        with:
+          git_commit_gpgsign: true
+          git_tag_gpgsign: true
+          git_user_signingkey: true
+          gpg_private_key: ${{ secrets.GPG_KEY_CONTENTS }}
+          passphrase: ${{ secrets.GPG_KEY_PASSPHRASE }}
+
+      - name: Install JDK
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5.0.2
+
+      - name: Create and Switch to Release Branch
+        run: |
+          git fetch origin
+          if ! git ls-remote --exit-code --heads --quiet origin refs/heads/${RELEASE_BRANCH}; then
+            git checkout -b ${RELEASE_BRANCH}
+            git push -u origin ${RELEASE_BRANCH}
+
+            # create a PR to bump main branch to the next snapshot version
+            echo "CREATE_PR=true" >> $GITHUB_ENV
+            echo "PR_TITLE=chore(release): Bump versions for v$NEXT_VERSION_SNAPSHOT" >> $GITHUB_ENV
+          else
+            git checkout ${RELEASE_BRANCH}
+          fi
+
+      - name: Bump Version
+        run: ./gradlew versionAsSpecified -PnewVersion=${{ env.VERSION }}
+
+      - name: Close the Milestone
+        if: ${{ steps.version_parser.outputs.prerelease == '' }}
+        id: milestone
+        uses: step-security/close-milestone@b097272a7aaa0f5c40dc6bc671d45d35c5e85b51 # v2.2.1
+        with:
+          milestone_name: ${{ steps.version_parser.outputs.release }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
+
+      - name: Commit and Tag
+        uses: step-security/git-auto-commit-action@905c3cd6e9ed2b67b4d46ff401fdb6d745d0ff9d # v7.1.0
+        with:
+          commit_author: ${{ steps.gpg_importer.outputs.name }} <${{ steps.gpg_importer.outputs.email }}>
+          commit_message: Bump versions for ${{ env.RELEASE_TAG }}
+          commit_options: "--no-verify --signoff"
+          commit_user_name: ${{ steps.gpg_importer.outputs.name }}
+          commit_user_email: ${{ steps.gpg_importer.outputs.email }}
+          tagging_message: ${{ env.RELEASE_TAG }}
+
+      - name: Create Github Release
+        uses: step-security/release-action@03a57407052f15d1537fd5469a6fbbc536aba326 # v1.20.0
+        with:
+          allowUpdates: true
+          commit: ${{ env.RELEASE_BRANCH }}
+          draft: true
+          generateReleaseNotes: false
+          name: ${{ env.RELEASE_TAG }}
+          omitBody: ${{ steps.milestone.outputs.milestone_id == '' }}
+          prerelease: ${{ steps.version_parser.outputs.prerelease != '' }}
+          tag: ${{ env.RELEASE_TAG }}
+          token: ${{ secrets.GH_ACCESS_TOKEN }}
+
+  create_pr:
+    timeout-minutes: 10
+    name: Create PR
+    runs-on: bucky-linux-medium
+    needs: release
+    if: ${{ needs.release.outputs.create_pr == 'true' }}
+    env:
+      NEXT_VERSION_SNAPSHOT: ${{ needs.release.outputs.next_version_snapshot }}
+      RELEASE_BRANCH: ${{ needs.release.outputs.release_branch }}
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@58077d3c7e43986b6b15fba718e8ea69e387dfcc # v2.15.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout Repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: main
+          token: ${{ secrets.GH_ACCESS_TOKEN }}
+
+      - name: Import GPG Key
+        id: gpg_importer
+        uses: step-security/ghaction-import-gpg@69c854a83c7f79463f8bdf46772ab09826c560cd # v6.3.1
+        with:
+          git_commit_gpgsign: true
+          git_tag_gpgsign: true
+          git_user_signingkey: true
+          gpg_private_key: ${{ secrets.GPG_KEY_CONTENTS }}
+          passphrase: ${{ secrets.GPG_KEY_PASSPHRASE }}
+
+      - name: Install JDK
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5.0.2
+
+      - name: Reset main to release branch
+        run: |
+          git fetch origin $RELEASE_BRANCH:$RELEASE_BRANCH
+          git reset --hard $RELEASE_BRANCH
+
+      - name: Gradle Release for Next Minor Snapshot
+        run: ./gradlew versionAsSpecified -PnewVersion=${{ env.NEXT_VERSION_SNAPSHOT }}
+
+      - name: Create Pull Request
+        uses: step-security/create-pull-request@e604d57b37b404d8bb34d152fa905e45d003a895 # v8.1.0
+        with:
+          author: ${{ steps.gpg_importer.outputs.name }} <${{ steps.gpg_importer.outputs.email }}>
+          body: Bump versions for v${{ env.NEXT_VERSION_SNAPSHOT }}
+          branch: create-pull-request/${{ env.RELEASE_BRANCH }}
+          commit-message: Bump versions for v${{ env.NEXT_VERSION_SNAPSHOT }}
+          committer: ${{ steps.gpg_importer.outputs.name }} <${{ steps.gpg_importer.outputs.email }}>
+          delete-branch: true
+          signoff: true
+          title: ${{ needs.release.outputs.pr_title }}
+          token: ${{ secrets.GH_ACCESS_TOKEN }}
