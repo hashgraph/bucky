@@ -423,7 +423,7 @@ public final class S3Client implements AutoCloseable {
      * @throws S3ResponseException if a non-200 response is received from S3
      * @throws IOException if an error occurs while reading the response body
      */
-    String createMultipartUpload(
+    public String createMultipartUpload(
             @NonNull final String key, @NonNull final String storageClass, @NonNull final String contentType)
             throws S3ResponseException, IOException {
         // build the canonical query string
@@ -464,7 +464,7 @@ public final class S3Client implements AutoCloseable {
      * @throws S3ResponseException if a non-200 response is received from S3
      * @throws IOException if an error occurs while reading the response body
      */
-    String multipartUploadPart(
+    public String multipartUploadPart(
             @NonNull final String key,
             @NonNull final String uploadId,
             final int partNumber,
@@ -506,7 +506,7 @@ public final class S3Client implements AutoCloseable {
      * @throws S3ResponseException if a non-200 response is received from S3
      * @throws IOException if an error occurs while reading the response body in case of non 200 response
      */
-    void completeMultipartUpload(
+    public void completeMultipartUpload(
             @NonNull final String key, @NonNull final String uploadId, @NonNull final List<String> eTags)
             throws S3ResponseException, IOException {
         // build canonical query string
