@@ -1348,6 +1348,38 @@ public final class S3Client implements AutoCloseable {
     // -------------------------------------------------------------------------
 
     /**
+     * Opens a streaming download of an object from S3.
+     * The caller is responsible for closing the returned InputStream.
+     *
+     * @param key the key for the object in S3 (e.g., "my_folder/my_file.txt"), cannot be blank
+     * @return an InputStream to read the object content, or null if the object doesn't exist
+     * @throws S3ResponseException if a non-200/404 response is received from S3
+     * @throws IOException if an error occurs while reading the response body on failure
+     */
+    public InputStream openObjectStream(@NonNull final String key) throws S3ResponseException, IOException {
+        Preconditions.requireNotBlank(key);
+        // build the URL for the request
+        final String url = endpoint + bucketName + "/" + urlEncode(key, true);
+        // make the request
+        final HttpResponse<InputStream> response =
+                request(url, GET, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
+        // check status code and return stream or throw
+        final int responseStatusCode = response.statusCode();
+        if (responseStatusCode == 404) {
+            response.body().close();
+            return null;
+        } else if (responseStatusCode != 200) {
+            try (final InputStream in = response.body()) {
+                final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
+                final String message = "Failed to open stream for object: key=%s".formatted(key);
+                throw new S3ResponseException(responseStatusCode, responseBody, response.headers(), message);
+            }
+        }
+        // caller is responsible for closing this stream
+        return response.body();
+    }
+
+    /**
      * Performs an HTTP request to S3 to the specified URL with the given parameters.
      *
      * @param url The URL to send the request to
