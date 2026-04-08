@@ -27,6 +27,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.Iterator;
@@ -544,6 +545,129 @@ public final class S3Client implements AutoCloseable {
             }
         }
     }
+
+    /**
+     * Lists the parts that have already been uploaded for an in-progress multipart upload.
+     *
+     * @param key the object key of the multipart upload. Cannot be blank
+     * @param uploadId the upload ID returned by {@link #createMultipartUpload}. Cannot be blank
+     * @return the parts uploaded so far, sorted by part number; empty if no parts have been uploaded
+     * @throws S3ResponseException if a non-200 response is received from S3
+     * @throws IOException if an error occurs while reading the response body
+     */
+    @NonNull
+    public List<PartInfo> listParts(@NonNull final String key, @NonNull final String uploadId)
+            throws S3ResponseException, IOException {
+        Preconditions.requireNotBlank(key);
+        Preconditions.requireNotBlank(uploadId);
+        final String canonicalQueryString = "max-parts=1000&uploadId=" + uploadId;
+        final String url = endpoint + bucketName + "/" + urlEncode(key, true) + "?" + canonicalQueryString;
+        final HttpResponse<InputStream> response =
+                request(url, GET, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
+        final int responseStatusCode = response.statusCode();
+        try (final InputStream in = response.body()) {
+            if (responseStatusCode != 200) {
+                final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
+                final HttpHeaders responseHeaders = response.headers();
+                final String message = "Failed to list parts: key=%s, uploadId=%s".formatted(key, uploadId);
+                throw new S3ResponseException(responseStatusCode, responseBody, responseHeaders, message);
+            }
+            final List<PartInfo> parts = new ArrayList<>();
+            final NodeList partNodes = parseDocument(in).getElementsByTagName("Part");
+            for (int i = 0; i < partNodes.getLength(); i++) {
+                final Element part = (Element) partNodes.item(i);
+                final int partNumber = Integer.parseInt(
+                        part.getElementsByTagName("PartNumber").item(0).getTextContent());
+                final long size =
+                        Long.parseLong(part.getElementsByTagName("Size").item(0).getTextContent());
+                final String etag = part.getElementsByTagName("ETag").item(0).getTextContent();
+                parts.add(new PartInfo(partNumber, size, etag));
+            }
+            parts.sort(Comparator.comparingInt(PartInfo::partNumber));
+            return Collections.unmodifiableList(parts);
+        }
+    }
+
+    /**
+     * Copies a byte range from an existing S3 object into a part of a new multipart upload.
+     * This is a server-side copy — no data is transferred through the client.
+     *
+     * @param sourceKey  the key of the object to copy from. Cannot be blank
+     * @param startByte  the first byte of the range to copy (inclusive, 0-based)
+     * @param endByte    the last byte of the range to copy (inclusive)
+     * @param destKey    the key of the multipart upload target. Cannot be blank
+     * @param uploadId   the upload ID of the target multipart upload. Cannot be blank
+     * @param partNumber the 1-based part number within the target upload
+     * @return the ETag of the newly created part
+     * @throws S3ResponseException if a non-200 response is received from S3
+     * @throws IOException if an error occurs while reading the response body
+     */
+    @NonNull
+    public String uploadPartCopy(
+            @NonNull final String sourceKey,
+            final long startByte,
+            final long endByte,
+            @NonNull final String destKey,
+            @NonNull final String uploadId,
+            final int partNumber)
+            throws S3ResponseException, IOException {
+        Preconditions.requireNotBlank(sourceKey);
+        Preconditions.requireNotBlank(destKey);
+        Preconditions.requireNotBlank(uploadId);
+        final String canonicalQueryString = "partNumber=" + partNumber + "&uploadId=" + uploadId;
+        final Map<String, String> headers = new HashMap<>();
+        headers.put("x-amz-copy-source", "/" + bucketName + "/" + urlEncode(sourceKey, true));
+        headers.put("x-amz-copy-source-range", "bytes=" + startByte + "-" + endByte);
+        final String url = endpoint + bucketName + "/" + urlEncode(destKey, true) + "?" + canonicalQueryString;
+        final HttpResponse<InputStream> response = request(url, PUT, headers, null, BodyHandlers.ofInputStream());
+        final int responseStatusCode = response.statusCode();
+        try (final InputStream in = response.body()) {
+            if (responseStatusCode != 200) {
+                final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
+                final HttpHeaders responseHeaders = response.headers();
+                final String message = "Failed to copy part: sourceKey=%s, destKey=%s, uploadId=%s, partNumber=%d"
+                        .formatted(sourceKey, destKey, uploadId, partNumber);
+                throw new S3ResponseException(responseStatusCode, responseBody, responseHeaders, message);
+            }
+            return parseDocument(in).getElementsByTagName("ETag").item(0).getTextContent();
+        }
+    }
+
+    /**
+     * Downloads a byte range of an S3 object into memory.
+     *
+     * @param key       the object key. Cannot be blank
+     * @param startByte the first byte of the range to download (inclusive, 0-based)
+     * @param endByte   the last byte of the range to download (inclusive)
+     * @return the requested bytes
+     * @throws S3ResponseException if a non-206/200 response is received from S3
+     * @throws IOException if an error occurs while reading the response body
+     */
+    @NonNull
+    public byte[] downloadObjectRange(@NonNull final String key, final long startByte, final long endByte)
+            throws S3ResponseException, IOException {
+        Preconditions.requireNotBlank(key);
+        final Map<String, String> headers = new HashMap<>();
+        headers.put("Range", "bytes=" + startByte + "-" + endByte);
+        final String url = endpoint + bucketName + "/" + urlEncode(key, true);
+        final HttpResponse<byte[]> response = request(url, GET, headers, null, BodyHandlers.ofByteArray());
+        final int responseStatusCode = response.statusCode();
+        if (responseStatusCode == 206 || responseStatusCode == 200) {
+            return response.body();
+        }
+        final String message =
+                "Failed to download object range: key=%s, range=%d-%d".formatted(key, startByte, endByte);
+        throw new S3ResponseException(responseStatusCode, null, response.headers(), message);
+    }
+
+    /**
+     * Carries the metadata of one part in an in-progress multipart upload.
+     *
+     * @param partNumber the 1-based part number
+     * @param size       the size of the part in bytes
+     * @param etag       the ETag returned by S3 when the part was uploaded
+     */
+    public record PartInfo(int partNumber, long size, String etag) {}
 
     /**
      * Performs an HTTP request to S3 to the specified URL with the given parameters.
