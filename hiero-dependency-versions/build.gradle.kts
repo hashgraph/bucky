@@ -30,6 +30,9 @@ dependencies.constraints {
 
     api("org.junit.jupiter:junit-jupiter-api:$junit5") { because("org.junit.jupiter.api") }
     api("org.junit.jupiter:junit-jupiter-engine:$junit5") { because("org.junit.jupiter.engine") }
+    api("org.junit.platform:junit-platform-launcher:$junit5") {
+        because("org.junit.platform.launcher")
+    }
 
     api("org.assertj:assertj-core:3.27.7") { because("org.assertj.core") }
 
