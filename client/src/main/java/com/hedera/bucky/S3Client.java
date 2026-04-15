@@ -4,6 +4,7 @@ package com.hedera.bucky;
 import com.hedera.bucky.utils.Preconditions;
 import com.hedera.bucky.utils.StringUtilities;
 import edu.umd.cs.findbugs.annotations.NonNull;
+import edu.umd.cs.findbugs.annotations.Nullable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
@@ -27,7 +28,6 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.Iterator;
@@ -36,7 +36,9 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
+import java.util.SortedMap;
 import java.util.TreeMap;
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import javax.crypto.Mac;
@@ -195,6 +197,60 @@ public final class S3Client implements AutoCloseable {
                 }
                 return keys;
             }
+        }
+    }
+
+    /**
+     * Lists one page of objects in the S3 bucket with the specified prefix.
+     *
+     * <p>Pass {@code null} as {@code continuationToken} to start from the beginning.
+     * When the returned {@link ListPage#continuationToken()} is non-null, pass it back
+     * to retrieve the next page.  Keys on each page are returned in alphabetical order.
+     *
+     * @param prefix            the prefix to filter objects; use an empty string to list all
+     * @param continuationToken token from the previous page, or {@code null} for the first page
+     * @param maxResults        maximum number of keys to return (1–1000)
+     * @return a page of keys and an optional token for the next page
+     * @throws S3ResponseException if a non-200 response is received from S3
+     * @throws IOException         if an error occurs while reading the response body
+     */
+    public ListPage listObjectsPage(
+            @NonNull final String prefix, @Nullable final String continuationToken, final int maxResults)
+            throws S3ResponseException, IOException {
+        Objects.requireNonNull(prefix);
+        Preconditions.requireInRange(maxResults, 1, 1000);
+        String canonicalQueryString = "list-type=2&max-keys=" + maxResults + "&prefix=" + prefix;
+        if (continuationToken != null) {
+            canonicalQueryString +=
+                    "&continuation-token=" + URLEncoder.encode(continuationToken, StandardCharsets.UTF_8);
+        }
+        final String url = endpoint + bucketName + "/?" + canonicalQueryString;
+        final HttpResponse<InputStream> response =
+                request(url, GET, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
+        final int responseStatusCode = response.statusCode();
+        try (final InputStream in = response.body()) {
+            if (responseStatusCode != 200) {
+                final String formattedPrefix = StringUtilities.isBlank(prefix) ? "BLANK_PREFIX" : prefix;
+                final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
+                final HttpHeaders responseHeaders = response.headers();
+                final String message = "Unsuccessful listing of objects: prefix=%s, maxResults=%s"
+                        .formatted(formattedPrefix, maxResults);
+                throw new S3ResponseException(responseStatusCode, responseBody, responseHeaders, message);
+            }
+            final List<String> keys = new ArrayList<>();
+            final org.w3c.dom.Document document = parseDocument(in);
+            final NodeList contentsNodes = document.getElementsByTagName("Contents");
+            for (int i = 0; i < contentsNodes.getLength(); i++) {
+                final Element contentsElement = (Element) contentsNodes.item(i);
+                final NodeList keyNodes = contentsElement.getElementsByTagName("Key");
+                if (keyNodes.getLength() > 0) {
+                    keys.add(keyNodes.item(0).getTextContent());
+                }
+            }
+            final NodeList tokenNodes = document.getElementsByTagName("NextContinuationToken");
+            final String nextToken =
+                    tokenNodes.getLength() > 0 ? tokenNodes.item(0).getTextContent() : null;
+            return new ListPage(keys, nextToken);
         }
     }
 
@@ -572,7 +628,7 @@ public final class S3Client implements AutoCloseable {
                 final String message = "Failed to list parts: key=%s, uploadId=%s".formatted(key, uploadId);
                 throw new S3ResponseException(responseStatusCode, responseBody, responseHeaders, message);
             }
-            final List<PartInfo> parts = new ArrayList<>();
+            final SortedMap<Integer, PartInfo> parts = new ConcurrentSkipListMap<>();
             final NodeList partNodes = parseDocument(in).getElementsByTagName("Part");
             for (int i = 0; i < partNodes.getLength(); i++) {
                 final Element part = (Element) partNodes.item(i);
@@ -581,10 +637,9 @@ public final class S3Client implements AutoCloseable {
                 final long size =
                         Long.parseLong(part.getElementsByTagName("Size").item(0).getTextContent());
                 final String etag = part.getElementsByTagName("ETag").item(0).getTextContent();
-                parts.add(new PartInfo(partNumber, size, etag));
+                parts.put(partNumber, new PartInfo(partNumber, size, etag));
             }
-            parts.sort(Comparator.comparingInt(PartInfo::partNumber));
-            return Collections.unmodifiableList(parts);
+            return parts.values().stream().toList();
         }
     }
 
@@ -668,6 +723,15 @@ public final class S3Client implements AutoCloseable {
      * @param etag       the ETag returned by S3 when the part was uploaded
      */
     public record PartInfo(int partNumber, long size, String etag) {}
+
+    /**
+     * Carries one page of S3 list results plus an optional continuation token for the next page.
+     *
+     * @param keys                the object keys (or common prefixes) returned in this page
+     * @param continuationToken   token to pass to the next call to retrieve the following page;
+     *                            {@code null} when this is the last page
+     */
+    public record ListPage(List<String> keys, @Nullable String continuationToken) {}
 
     /**
      * Performs an HTTP request to S3 to the specified URL with the given parameters.
