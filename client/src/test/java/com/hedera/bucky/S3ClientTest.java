@@ -636,6 +636,203 @@ public class S3ClientTest {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // listParts — input validation
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#listParts(String, String)} throws
+     * {@link IllegalArgumentException} for a blank key.
+     */
+    @Test
+    @DisplayName("listParts() throws IllegalArgumentException for a blank key")
+    void testListPartsRejectsBlankKey() throws S3ClientInitializationException {
+        try (final S3Client s3Client = client()) {
+            assertThatThrownBy(() -> s3Client.listParts("", "some-upload-id"))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.listParts("  ", "some-upload-id"))
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    /**
+     * Verifies that {@link S3Client#listParts(String, String)} throws
+     * {@link IllegalArgumentException} for a blank upload ID.
+     */
+    @Test
+    @DisplayName("listParts() throws IllegalArgumentException for a blank uploadId")
+    void testListPartsRejectsBlankUploadId() throws S3ClientInitializationException {
+        try (final S3Client s3Client = client()) {
+            assertThatThrownBy(() -> s3Client.listParts("some-key", "")).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.listParts("some-key", "  ")).isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // listParts — integration
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#listParts(String, String)} returns an empty
+     * list when no parts have been uploaded for the in-progress multipart upload.
+     */
+    @Test
+    @DisplayName("listParts() returns an empty list when no parts have been uploaded")
+    void testListPartsReturnsEmptyWhenNoPartsUploaded() throws Exception {
+        final String key = "testListPartsEmpty.txt";
+        try (final S3Client s3Client = client()) {
+            final String uploadId = s3Client.createMultipartUpload(key, "STANDARD", "plain/text");
+            try {
+                final List<S3Client.PartInfo> parts = s3Client.listParts(key, uploadId);
+                assertThat(parts).isNotNull().isEmpty();
+            } finally {
+                s3Client.abortMultipartUpload(key, uploadId);
+            }
+        }
+    }
+
+    /**
+     * Verifies that {@link S3Client#listParts(String, String)} returns all
+     * uploaded parts and that they are sorted by part number even when uploaded
+     * out of order.
+     */
+    @Test
+    @DisplayName("listParts() returns uploaded parts sorted by part number")
+    void testListPartsReturnsUploadedPartsSortedByPartNumber() throws Exception {
+        final String key = "testListPartsSorted.txt";
+        // Part size is only validated at completion; use small data since we abort before completing.
+        final byte[] part1Data = "part-one".getBytes(StandardCharsets.UTF_8);
+        final byte[] part2Data = "part-two".getBytes(StandardCharsets.UTF_8);
+        try (final S3Client s3Client = client()) {
+            final String uploadId = s3Client.createMultipartUpload(key, "STANDARD", "plain/text");
+            try {
+                // Upload in reverse order to confirm the result is sorted by part number.
+                s3Client.multipartUploadPart(key, uploadId, 2, part2Data);
+                s3Client.multipartUploadPart(key, uploadId, 1, part1Data);
+                final List<S3Client.PartInfo> parts = s3Client.listParts(key, uploadId);
+                assertThat(parts).hasSize(2);
+                assertThat(parts.get(0).partNumber()).isEqualTo(1);
+                assertThat(parts.get(0).size()).isEqualTo(part1Data.length);
+                assertThat(parts.get(0).etag()).isNotBlank();
+                assertThat(parts.get(1).partNumber()).isEqualTo(2);
+                assertThat(parts.get(1).size()).isEqualTo(part2Data.length);
+                assertThat(parts.get(1).etag()).isNotBlank();
+            } finally {
+                s3Client.abortMultipartUpload(key, uploadId);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // uploadPartCopy — input validation
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#uploadPartCopy} throws
+     * {@link IllegalArgumentException} for a blank source key, dest key, or upload ID.
+     */
+    @Test
+    @DisplayName("uploadPartCopy() throws IllegalArgumentException for blank parameters")
+    void testUploadPartCopyRejectsBlankParameters() throws S3ClientInitializationException {
+        try (final S3Client s3Client = client()) {
+            assertThatThrownBy(() -> s3Client.uploadPartCopy("", 0, 9, "destKey", "upload-id", 1))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.uploadPartCopy("srcKey", 0, 9, "", "upload-id", 1))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.uploadPartCopy("srcKey", 0, 9, "destKey", "", 1))
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // uploadPartCopy — integration
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#uploadPartCopy} performs a server-side byte-range
+     * copy from an existing object into a multipart upload part, and that the resulting
+     * completed object contains exactly the copied bytes.
+     */
+    @Test
+    @DisplayName("uploadPartCopy() copies a byte range from an existing object into a new object")
+    void testUploadPartCopyCopiesRangeIntoNewObject() throws Exception {
+        final String sourceKey = "testUploadPartCopySource.txt";
+        final String destKey = "testUploadPartCopyDest.txt";
+        final byte[] sourceContent = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".getBytes(StandardCharsets.UTF_8);
+        minioClient.putObject(PutObjectArgs.builder().bucket(BUCKET_NAME).object(sourceKey).stream(
+                        new ByteArrayInputStream(sourceContent), sourceContent.length, -1)
+                .build());
+        try (final S3Client s3Client = client()) {
+            // Copy bytes 5–9 inclusive ("FGHIJ") as the only part of a new multipart upload.
+            final String uploadId = s3Client.createMultipartUpload(destKey, "STANDARD", "plain/text");
+            final String etag = s3Client.uploadPartCopy(sourceKey, 5, 9, destKey, uploadId, 1);
+            assertThat(etag).isNotBlank();
+            s3Client.completeMultipartUpload(destKey, uploadId, List.of(etag));
+        }
+        final byte[] actual = minioClient
+                .getObject(GetObjectArgs.builder()
+                        .bucket(BUCKET_NAME)
+                        .object(destKey)
+                        .build())
+                .readAllBytes();
+        assertThat(actual).isEqualTo("FGHIJ".getBytes(StandardCharsets.UTF_8));
+    }
+
+    // -----------------------------------------------------------------------
+    // downloadObjectRange — input validation
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#downloadObjectRange(String, long, long)} throws
+     * {@link IllegalArgumentException} for a blank key.
+     */
+    @Test
+    @DisplayName("downloadObjectRange() throws IllegalArgumentException for a blank key")
+    void testDownloadObjectRangeRejectsBlankKey() throws S3ClientInitializationException {
+        try (final S3Client s3Client = client()) {
+            assertThatThrownBy(() -> s3Client.downloadObjectRange("", 0, 9))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.downloadObjectRange("  ", 0, 9))
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // downloadObjectRange — integration
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#downloadObjectRange(String, long, long)} returns
+     * the correct byte slice of an existing object.
+     */
+    @Test
+    @DisplayName("downloadObjectRange() returns the expected bytes for a given range")
+    void testDownloadObjectRangeReturnsExpectedBytes() throws Exception {
+        final String key = "testDownloadObjectRange.txt";
+        final byte[] content = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".getBytes(StandardCharsets.UTF_8);
+        minioClient.putObject(PutObjectArgs.builder().bucket(BUCKET_NAME).object(key).stream(
+                        new ByteArrayInputStream(content), content.length, -1)
+                .build());
+        try (final S3Client s3Client = client()) {
+            // bytes 2–6 inclusive = 'C','D','E','F','G'
+            final byte[] actual = s3Client.downloadObjectRange(key, 2, 6);
+            assertThat(actual).isEqualTo("CDEFG".getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    /**
+     * Verifies that {@link S3Client#downloadObjectRange(String, long, long)} throws
+     * {@link S3ResponseException} when the requested object does not exist.
+     */
+    @Test
+    @DisplayName("downloadObjectRange() throws S3ResponseException for a non-existent object")
+    void testDownloadObjectRangeThrowsForNonExistentObject() throws S3ClientInitializationException {
+        try (final S3Client s3Client = client()) {
+            assertThatThrownBy(() -> s3Client.downloadObjectRange("non-existent-range-object.txt", 0, 9))
+                    .isInstanceOf(S3ResponseException.class);
+        }
+    }
+
     /**
      * This method will create a new instance of the {@link S3Client} to test.
      */
