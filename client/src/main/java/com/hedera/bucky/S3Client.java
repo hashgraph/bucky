@@ -70,6 +70,10 @@ public final class S3Client implements AutoCloseable {
     private static final String ALGORITHM = "HMAC-SHA256";
     /** AWS4 signature terminator **/
     private static final String TERMINATOR = "aws4_request";
+    /** Minimum number of objects that can be requested in a single list-objects page. */
+    public static final int LIST_OBJECTS_MIN = 1;
+    /** Maximum number of objects that can be requested in a single list-objects page, as defined by the S3 API. */
+    public static final int LIST_OBJECTS_MAX = 1000;
     /** Format strings for the date/time and date stamps required during signing **/
     private static final DateTimeFormatter DATE_TIME_FORMATTER =
             DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(java.time.ZoneOffset.UTC);
@@ -163,7 +167,7 @@ public final class S3Client implements AutoCloseable {
     public List<String> listObjects(@NonNull final String prefix, final int maxResults)
             throws S3ResponseException, IOException {
         Objects.requireNonNull(prefix);
-        Preconditions.requireInRange(maxResults, 1, 1000);
+        Preconditions.requireInRange(maxResults, LIST_OBJECTS_MIN, LIST_OBJECTS_MAX);
         // build a canonical query string with the prefix and max results
         final String canonicalQueryString = "list-type=2&prefix=" + prefix + "&max-keys=" + maxResults;
         // build the URL for the request
@@ -215,7 +219,7 @@ public final class S3Client implements AutoCloseable {
             final int maxResults)
             throws S3ResponseException, IOException {
         Objects.requireNonNull(prefix);
-        Preconditions.requireInRange(maxResults, 1, 1000);
+        Preconditions.requireInRange(maxResults, LIST_OBJECTS_MIN, LIST_OBJECTS_MAX);
         final String url = endpoint + bucketName + "/?"
                 + buildListPageQueryString(prefix, maxResults, delimiter, continuationToken);
         final HttpResponse<InputStream> response =
@@ -402,7 +406,7 @@ public final class S3Client implements AutoCloseable {
                     System.arraycopy(next, next.length - remainingContent, chunk, offsetInChunk, length);
                     remainingContent -= length;
                     // we now have a full chunk so need to upload the chunk to S3
-                    eTags.add(multipartUploadPart(objectKey, uploadId, eTags.size() + 1, chunk));
+                    eTags.add(multipartUploadPart(objectKey, uploadId, eTags.size() + LIST_OBJECTS_MIN, chunk));
                     // reset the offset in the chunk
                     offsetInChunk = 0;
                 } else {
@@ -419,7 +423,7 @@ public final class S3Client implements AutoCloseable {
             byte[] lastChunk = new byte[offsetInChunk];
             System.arraycopy(chunk, 0, lastChunk, 0, offsetInChunk);
             // we have a partial chunk so need to upload it to S3
-            eTags.add(multipartUploadPart(objectKey, uploadId, eTags.size() + 1, lastChunk));
+            eTags.add(multipartUploadPart(objectKey, uploadId, eTags.size() + LIST_OBJECTS_MIN, lastChunk));
         }
         // Complete the multipart upload
         completeMultipartUpload(objectKey, uploadId, eTags);
@@ -612,7 +616,7 @@ public final class S3Client implements AutoCloseable {
         sb.append("<CompleteMultipartUpload>");
         for (int i = 0; i < eTags.size(); i++) {
             sb.append("<Part><PartNumber>")
-                    .append(i + 1)
+                    .append(i + LIST_OBJECTS_MIN)
                     .append("</PartNumber><ETag>")
                     .append(eTags.get(i))
                     .append("</ETag></Part>");
@@ -839,7 +843,7 @@ public final class S3Client implements AutoCloseable {
             return Collections.emptyMap();
         } else {
             final Map<String, String> results = new HashMap<>();
-            final int endIndex = rawQuery.length() - 1;
+            final int endIndex = rawQuery.length() - LIST_OBJECTS_MIN;
             int index = 0;
             while (index <= endIndex) {
                 // Ideally we should first look for '&', then look for '=' before the '&', but that's not how AWS
@@ -853,15 +857,15 @@ public final class S3Client implements AutoCloseable {
                     // No value
                     name = rawQuery.substring(index);
                     value = null;
-                    index = endIndex + 1;
+                    index = endIndex + LIST_OBJECTS_MIN;
                 } else {
                     int parameterSeparatorIndex = rawQuery.indexOf(QUERY_PARAMETER_SEPARATOR, nameValueSeparatorIndex);
                     if (parameterSeparatorIndex < 0) {
-                        parameterSeparatorIndex = endIndex + 1;
+                        parameterSeparatorIndex = endIndex + LIST_OBJECTS_MIN;
                     }
                     name = rawQuery.substring(index, nameValueSeparatorIndex);
-                    value = rawQuery.substring(nameValueSeparatorIndex + 1, parameterSeparatorIndex);
-                    index = parameterSeparatorIndex + 1;
+                    value = rawQuery.substring(nameValueSeparatorIndex + LIST_OBJECTS_MIN, parameterSeparatorIndex);
+                    index = parameterSeparatorIndex + LIST_OBJECTS_MIN;
                 }
                 // note that value = null is valid as we can have a parameter without a value in
                 // a query string (legal http)
@@ -909,7 +913,7 @@ public final class S3Client implements AutoCloseable {
         // determine host header
         String hostHeader = endpointUrl.getHost();
         final int port = endpointUrl.getPort();
-        if (port > -1) {
+        if (port > -LIST_OBJECTS_MIN) {
             hostHeader = hostHeader.concat(":" + port);
         }
         // update the host header
