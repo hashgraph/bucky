@@ -838,14 +838,15 @@ public class S3ClientTest {
     // -----------------------------------------------------------------------
 
     /**
-     * Verifies that {@link S3Client#listObjectsPage(String, String, int)} throws
+     * Verifies that {@link S3Client#listObjectsPage(String, String, String, int)} throws
      * {@link NullPointerException} when {@code prefix} is {@code null}.
      */
     @Test
     @DisplayName("listObjectsPage() throws NullPointerException for a null prefix")
     void testListObjectsPageRejectsNullPrefix() throws S3ClientInitializationException {
         try (final S3Client s3Client = client()) {
-            assertThatThrownBy(() -> s3Client.listObjectsPage(null, null, 10)).isInstanceOf(NullPointerException.class);
+            assertThatThrownBy(() -> s3Client.listObjectsPage(null, null, null, 10))
+                    .isInstanceOf(NullPointerException.class);
         }
     }
 
@@ -854,7 +855,7 @@ public class S3ClientTest {
     // -----------------------------------------------------------------------
 
     /**
-     * Verifies that {@link S3Client#listObjectsPage(String, String, int)} returns
+     * Verifies that {@link S3Client#listObjectsPage(String, String, String, int)} returns
      * an empty key list and a {@code null} continuation token when no objects
      * match the given prefix.
      */
@@ -862,7 +863,7 @@ public class S3ClientTest {
     @DisplayName("listObjectsPage() returns an empty page when no objects match the prefix")
     void testListObjectsPageReturnsEmptyPageForNonExistentPrefix() throws Exception {
         try (final S3Client s3Client = client()) {
-            final S3Client.ListPage page = s3Client.listObjectsPage("no-such-prefix-xyz-", null, 100);
+            final S3Client.ListPage page = s3Client.listObjectsPage("no-such-prefix-xyz-", null, null, 100);
             assertThat(page).isNotNull();
             assertThat(page.keys()).isNotNull().isEmpty();
             assertThat(page.continuationToken()).isNull();
@@ -870,7 +871,7 @@ public class S3ClientTest {
     }
 
     /**
-     * Verifies that {@link S3Client#listObjectsPage(String, String, int)} returns
+     * Verifies that {@link S3Client#listObjectsPage(String, String, String, int)} returns
      * all matching keys and a {@code null} continuation token when the total
      * number of objects fits within a single page.
      */
@@ -886,14 +887,14 @@ public class S3ClientTest {
                     .build());
         }
         try (final S3Client s3Client = client()) {
-            final S3Client.ListPage page = s3Client.listObjectsPage(keyPrefix, null, 100);
+            final S3Client.ListPage page = s3Client.listObjectsPage(keyPrefix, null, null, 100);
             assertThat(page.keys()).containsExactlyInAnyOrderElementsOf(expected);
             assertThat(page.continuationToken()).isNull();
         }
     }
 
     /**
-     * Verifies that {@link S3Client#listObjectsPage(String, String, int)} returns
+     * Verifies that {@link S3Client#listObjectsPage(String, String, String, int)} returns
      * a non-null continuation token when {@code maxResults} is smaller than the
      * total number of matching objects, indicating more pages are available.
      */
@@ -910,7 +911,7 @@ public class S3ClientTest {
         }
         try (final S3Client s3Client = client()) {
             // Request fewer results than the number of uploaded objects.
-            final S3Client.ListPage page = s3Client.listObjectsPage(keyPrefix, null, 1);
+            final S3Client.ListPage page = s3Client.listObjectsPage(keyPrefix, null, null, 1);
             assertThat(page.keys()).hasSize(1);
             assertThat(page.continuationToken()).isNotNull().isNotBlank();
         }
@@ -918,7 +919,7 @@ public class S3ClientTest {
 
     /**
      * Verifies that passing a continuation token from a previous call to
-     * {@link S3Client#listObjectsPage(String, String, int)} returns the next page
+     * {@link S3Client#listObjectsPage(String, String, String, int)} returns the next page
      * of results, and that all pages together contain every uploaded object exactly once.
      */
     @Test
@@ -941,12 +942,88 @@ public class S3ClientTest {
             final List<String> accumulated = new ArrayList<>();
             String token = null;
             do {
-                final S3Client.ListPage page = s3Client.listObjectsPage(keyPrefix, token, 2);
+                final S3Client.ListPage page = s3Client.listObjectsPage(keyPrefix, token, null, 2);
                 assertThat(page.keys()).isNotEmpty();
                 accumulated.addAll(page.keys());
                 token = page.continuationToken();
             } while (token != null);
             assertThat(accumulated).containsExactlyInAnyOrderElementsOf(uploaded);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // listObjectsPage — delimiter tests
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#listObjectsPage(String, String, String, int)} with a
+     * delimiter returns common prefixes (virtual directories) instead of individual keys.
+     * Objects under {@code dir1/} and {@code dir2/} should be grouped as two common prefixes.
+     */
+    @Test
+    @DisplayName("listObjectsPage() with delimiter returns common prefixes instead of flat keys")
+    void testListObjectsPageWithDelimiterReturnsCommonPrefixes() throws Exception {
+        final String keyPrefix = "delim-dirs-";
+        final String content = "delimiter content";
+        // Upload objects spread across two virtual directories.
+        final List<String> uploaded =
+                List.of(keyPrefix + "dir1/file-a.txt", keyPrefix + "dir1/file-b.txt", keyPrefix + "dir2/file-c.txt");
+        for (final String key : uploaded) {
+            minioClient.putObject(PutObjectArgs.builder().bucket(BUCKET_NAME).object(key).stream(
+                            new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8)), content.length(), -1)
+                    .build());
+        }
+        try (final S3Client s3Client = client()) {
+            final S3Client.ListPage page = s3Client.listObjectsPage(keyPrefix, null, "/", 100);
+            // Should return the two common prefixes, not the individual file keys.
+            assertThat(page.keys()).containsExactlyInAnyOrder(keyPrefix + "dir1/", keyPrefix + "dir2/");
+            assertThat(page.continuationToken()).isNull();
+        }
+    }
+
+    /**
+     * Verifies that {@link S3Client#listObjectsPage(String, String, String, int)} with a
+     * delimiter returns an empty list when no objects match the given prefix.
+     */
+    @Test
+    @DisplayName("listObjectsPage() with delimiter returns empty page for non-existent prefix")
+    void testListObjectsPageWithDelimiterReturnsEmptyPageForNonExistentPrefix() throws Exception {
+        try (final S3Client s3Client = client()) {
+            final S3Client.ListPage page = s3Client.listObjectsPage("no-such-delim-prefix-xyz-", null, "/", 100);
+            assertThat(page.keys()).isNotNull().isEmpty();
+            assertThat(page.continuationToken()).isNull();
+        }
+    }
+
+    /**
+     * Verifies that {@link S3Client#listObjectsPage(String, String, String, int)} with a
+     * delimiter correctly pages through common prefixes when there are more than
+     * {@code maxResults} virtual directories.
+     */
+    @Test
+    @DisplayName("listObjectsPage() with delimiter paginates common prefixes correctly")
+    void testListObjectsPageWithDelimiterPaginatesCommonPrefixes() throws Exception {
+        final String keyPrefix = "delim-page-";
+        final String content = "delimiter page content";
+        // Create three virtual directories, each with one object.
+        final List<String> uploaded =
+                List.of(keyPrefix + "alpha/file.txt", keyPrefix + "beta/file.txt", keyPrefix + "gamma/file.txt");
+        for (final String key : uploaded) {
+            minioClient.putObject(PutObjectArgs.builder().bucket(BUCKET_NAME).object(key).stream(
+                            new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8)), content.length(), -1)
+                    .build());
+        }
+        try (final S3Client s3Client = client()) {
+            final List<String> accumulated = new ArrayList<>();
+            String token = null;
+            do {
+                final S3Client.ListPage page = s3Client.listObjectsPage(keyPrefix, token, "/", 1);
+                assertThat(page.keys()).hasSize(1);
+                accumulated.addAll(page.keys());
+                token = page.continuationToken();
+            } while (token != null);
+            assertThat(accumulated)
+                    .containsExactlyInAnyOrder(keyPrefix + "alpha/", keyPrefix + "beta/", keyPrefix + "gamma/");
         }
     }
 

@@ -183,48 +183,41 @@ public final class S3Client implements AutoCloseable {
                         .formatted(formattedPrefix, maxResults);
                 throw new S3ResponseException(responseStatusCode, responseBody, responseHeaders, message);
             } else {
-                // extract the object keys from the XML response
-                final List<String> keys = new ArrayList<>();
-                // Get all "Contents" elements
-                final NodeList contentsNodes = parseDocument(in).getElementsByTagName("Contents");
-                for (int i = 0; i < contentsNodes.getLength(); i++) {
-                    final Element contentsElement = (Element) contentsNodes.item(i);
-                    // Get the "Key" element inside each "Contents"
-                    final NodeList keyNodes = contentsElement.getElementsByTagName("Key");
-                    if (keyNodes.getLength() > 0) {
-                        keys.add(keyNodes.item(0).getTextContent());
-                    }
-                }
-                return keys;
+                return extractChildText(parseDocument(in).getElementsByTagName("Contents"), "Key");
             }
         }
     }
 
     /**
-     * Lists one page of objects in the S3 bucket with the specified prefix.
+     * Lists one page of objects (or common prefixes) in the S3 bucket with the specified prefix.
      *
      * <p>Pass {@code null} as {@code continuationToken} to start from the beginning.
      * When the returned {@link ListPage#continuationToken()} is non-null, pass it back
-     * to retrieve the next page.  Keys on each page are returned in alphabetical order.
+     * to retrieve the next page.  Results on each page are returned in alphabetical order.
      *
-     * @param prefix            the prefix to filter objects; use an empty string to list all
+     * <p>When {@code delimiter} is {@code null}, the page contains object keys parsed from
+     * {@code <Contents>} elements.  When {@code delimiter} is non-null (e.g. {@code "/"}),
+     * it is sent as the S3 {@code delimiter} query parameter and the page contains common
+     * prefixes parsed from {@code <CommonPrefixes>} elements instead.
+     *
+     * @param prefix            the prefix to filter by; use an empty string to list all
      * @param continuationToken token from the previous page, or {@code null} for the first page
-     * @param maxResults        maximum number of keys to return (1–1000)
-     * @return a page of keys and an optional token for the next page
+     * @param delimiter         S3 grouping delimiter, or {@code null} for a flat object listing
+     * @param maxResults        maximum number of results to return (1–1000)
+     * @return a page of keys (or common prefixes) and an optional token for the next page
      * @throws S3ResponseException if a non-200 response is received from S3
      * @throws IOException         if an error occurs while reading the response body
      */
     public ListPage listObjectsPage(
-            @NonNull final String prefix, @Nullable final String continuationToken, final int maxResults)
+            @NonNull final String prefix,
+            @Nullable final String continuationToken,
+            @Nullable final String delimiter,
+            final int maxResults)
             throws S3ResponseException, IOException {
         Objects.requireNonNull(prefix);
         Preconditions.requireInRange(maxResults, 1, 1000);
-        String canonicalQueryString = "list-type=2&max-keys=" + maxResults + "&prefix=" + prefix;
-        if (continuationToken != null) {
-            canonicalQueryString +=
-                    "&continuation-token=" + URLEncoder.encode(continuationToken, StandardCharsets.UTF_8);
-        }
-        final String url = endpoint + bucketName + "/?" + canonicalQueryString;
+        final String url = endpoint + bucketName + "/?"
+                + buildListPageQueryString(prefix, maxResults, delimiter, continuationToken);
         final HttpResponse<InputStream> response =
                 request(url, GET, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
         final int responseStatusCode = response.statusCode();
@@ -236,22 +229,65 @@ public final class S3Client implements AutoCloseable {
                 final String message = "Unsuccessful listing of objects: prefix=%s, maxResults=%s"
                         .formatted(formattedPrefix, maxResults);
                 throw new S3ResponseException(responseStatusCode, responseBody, responseHeaders, message);
+            } else {
+                final Document document = parseDocument(in);
+                final String outerTag = delimiter != null ? "CommonPrefixes" : "Contents";
+                final String innerTag = delimiter != null ? "Prefix" : "Key";
+                final List<String> results = extractChildText(document.getElementsByTagName(outerTag), innerTag);
+                final NodeList tokenNodes = document.getElementsByTagName("NextContinuationToken");
+                final String nextToken =
+                        tokenNodes.getLength() > 0 ? tokenNodes.item(0).getTextContent() : null;
+                return new ListPage(results, nextToken);
             }
-            final List<String> keys = new ArrayList<>();
-            final org.w3c.dom.Document document = parseDocument(in);
-            final NodeList contentsNodes = document.getElementsByTagName("Contents");
-            for (int i = 0; i < contentsNodes.getLength(); i++) {
-                final Element contentsElement = (Element) contentsNodes.item(i);
-                final NodeList keyNodes = contentsElement.getElementsByTagName("Key");
-                if (keyNodes.getLength() > 0) {
-                    keys.add(keyNodes.item(0).getTextContent());
-                }
-            }
-            final NodeList tokenNodes = document.getElementsByTagName("NextContinuationToken");
-            final String nextToken =
-                    tokenNodes.getLength() > 0 ? tokenNodes.item(0).getTextContent() : null;
-            return new ListPage(keys, nextToken);
         }
+    }
+
+    /**
+     * Builds the canonical query string for a list-objects-v2 request.
+     *
+     * @param prefix            prefix filter
+     * @param maxResults        maximum keys to return
+     * @param delimiter         grouping delimiter, or {@code null} for a flat listing
+     * @param continuationToken pagination token from a previous page, or {@code null}
+     * @return the assembled query string (not URL-encoded as a whole; individual values are encoded)
+     */
+    private static String buildListPageQueryString(
+            final String prefix,
+            final int maxResults,
+            @Nullable final String delimiter,
+            @Nullable final String continuationToken) {
+        final StringBuilder queryString = new StringBuilder("list-type=2&max-keys=")
+                .append(maxResults)
+                .append("&prefix=")
+                .append(prefix);
+        if (delimiter != null) {
+            queryString.append("&delimiter=").append(URLEncoder.encode(delimiter, StandardCharsets.UTF_8));
+        }
+        if (continuationToken != null) {
+            queryString
+                    .append("&continuation-token=")
+                    .append(URLEncoder.encode(continuationToken, StandardCharsets.UTF_8));
+        }
+        return queryString.toString();
+    }
+
+    /**
+     * Extracts the text content of the first {@code childTag} element found inside each element of
+     * {@code parentNodes}, skipping any parent that does not contain the child tag.
+     *
+     * @param parentNodes the list of parent elements to iterate over
+     * @param childTag    the tag name of the child element whose text content is wanted
+     * @return a mutable list of text values, in document order
+     */
+    private List<String> extractChildText(final NodeList parentNodes, final String childTag) {
+        final List<String> result = new ArrayList<>();
+        for (int i = 0; i < parentNodes.getLength(); i++) {
+            final NodeList children = ((Element) parentNodes.item(i)).getElementsByTagName(childTag);
+            if (children.getLength() > 0) {
+                result.add(children.item(0).getTextContent());
+            }
+        }
+        return result;
     }
 
     /**
