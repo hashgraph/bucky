@@ -511,6 +511,32 @@ public final class S3Client implements AutoCloseable {
     }
 
     /**
+     * Deletes an object from the S3 bucket.
+     *
+     * @param key the object key to delete. Cannot be blank
+     * @throws S3ResponseException if a non-204 response is received from S3
+     * @throws IOException if an error occurs while reading the response body in case of non-204 response
+     */
+    public void deleteObject(@NonNull final String key) throws S3ResponseException, IOException {
+        Preconditions.requireNotBlank(key);
+        final String url = endpoint + bucketName + "/" + key;
+        final HttpResponse<InputStream> response =
+                request(url, DELETE, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
+        final int responseStatusCode = response.statusCode();
+        try (final InputStream in = response.body()) {
+            if (responseStatusCode != 204) {
+                final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
+                final HttpHeaders responseHeaders = response.headers();
+                throw new S3ResponseException(
+                        responseStatusCode,
+                        responseBody,
+                        responseHeaders,
+                        "Failed to remove object: key=%s".formatted(key));
+            }
+        }
+    }
+
+    /**
      * Creates a multipart upload for the specified object key.
      *
      * @param key The object key. Cannot be null
