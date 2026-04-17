@@ -567,6 +567,65 @@ public class S3ClientTest {
     }
 
     // -----------------------------------------------------------------------
+    // removeObject — input validation
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#deleteObject(String)} throws
+     * {@link IllegalArgumentException} for a blank key.
+     */
+    @Test
+    @DisplayName("removeObject() throws IllegalArgumentException for a blank key")
+    void testDeleteObjectRejectsBlankKey() throws S3ClientInitializationException {
+        try (final S3Client s3Client = client()) {
+            assertThatThrownBy(() -> s3Client.deleteObject("")).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.deleteObject("   ")).isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // removeObject — integration
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#deleteObject(String)} successfully removes
+     * an existing object so that it is no longer present in the bucket.
+     */
+    @Test
+    @DisplayName("removeObject() removes an existing object from the bucket")
+    void testDeleteObjectDeletesExistingObject() throws Exception {
+        final String key = "testRemoveObjectExisting.txt";
+        final String content = "to be removed";
+        minioClient.putObject(PutObjectArgs.builder().bucket(BUCKET_NAME).object(key).stream(
+                        new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8)), content.length(), -1)
+                .build());
+        try (final S3Client s3Client = client()) {
+            assertDoesNotThrow(() -> s3Client.deleteObject(key));
+        }
+        final boolean stillExists = minioClient
+                .listObjects(ListObjectsArgs.builder()
+                        .bucket(BUCKET_NAME)
+                        .prefix(key)
+                        .maxKeys(1)
+                        .build())
+                .iterator()
+                .hasNext();
+        assertThat(stillExists).isFalse();
+    }
+
+    /**
+     * Verifies that {@link S3Client#deleteObject(String)} does not throw when
+     * called with a key that does not exist in the bucket (S3 DELETE is idempotent).
+     */
+    @Test
+    @DisplayName("removeObject() does not throw for a non-existent key")
+    void testDeleteObjectOnNonExistentKeyDoesNotThrow() throws S3ClientInitializationException {
+        try (final S3Client s3Client = client()) {
+            assertDoesNotThrow(() -> s3Client.deleteObject("non-existent-object-to-remove.txt"));
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // listObjects — boundary and integration
     // -----------------------------------------------------------------------
 
