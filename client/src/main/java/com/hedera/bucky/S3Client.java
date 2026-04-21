@@ -4,6 +4,7 @@ package com.hedera.bucky;
 import com.hedera.bucky.utils.Preconditions;
 import com.hedera.bucky.utils.StringUtilities;
 import edu.umd.cs.findbugs.annotations.NonNull;
+import edu.umd.cs.findbugs.annotations.Nullable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
@@ -35,7 +36,9 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
+import java.util.SortedMap;
 import java.util.TreeMap;
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import javax.crypto.Mac;
@@ -67,6 +70,10 @@ public final class S3Client implements AutoCloseable {
     private static final String ALGORITHM = "HMAC-SHA256";
     /** AWS4 signature terminator **/
     private static final String TERMINATOR = "aws4_request";
+    /** Minimum number of objects that can be requested in a single list-objects page. */
+    public static final int LIST_OBJECTS_MIN = 1;
+    /** Maximum number of objects that can be requested in a single list-objects page, as defined by the S3 API. */
+    public static final int LIST_OBJECTS_MAX = 1000;
     /** Format strings for the date/time and date stamps required during signing **/
     private static final DateTimeFormatter DATE_TIME_FORMATTER =
             DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(java.time.ZoneOffset.UTC);
@@ -160,7 +167,7 @@ public final class S3Client implements AutoCloseable {
     public List<String> listObjects(@NonNull final String prefix, final int maxResults)
             throws S3ResponseException, IOException {
         Objects.requireNonNull(prefix);
-        Preconditions.requireInRange(maxResults, 1, 1000);
+        Preconditions.requireInRange(maxResults, LIST_OBJECTS_MIN, LIST_OBJECTS_MAX);
         // build a canonical query string with the prefix and max results
         final String canonicalQueryString = "list-type=2&prefix=" + prefix + "&max-keys=" + maxResults;
         // build the URL for the request
@@ -180,21 +187,111 @@ public final class S3Client implements AutoCloseable {
                         .formatted(formattedPrefix, maxResults);
                 throw new S3ResponseException(responseStatusCode, responseBody, responseHeaders, message);
             } else {
-                // extract the object keys from the XML response
-                final List<String> keys = new ArrayList<>();
-                // Get all "Contents" elements
-                final NodeList contentsNodes = parseDocument(in).getElementsByTagName("Contents");
-                for (int i = 0; i < contentsNodes.getLength(); i++) {
-                    final Element contentsElement = (Element) contentsNodes.item(i);
-                    // Get the "Key" element inside each "Contents"
-                    final NodeList keyNodes = contentsElement.getElementsByTagName("Key");
-                    if (keyNodes.getLength() > 0) {
-                        keys.add(keyNodes.item(0).getTextContent());
-                    }
-                }
-                return keys;
+                return extractChildText(parseDocument(in).getElementsByTagName("Contents"), "Key");
             }
         }
+    }
+
+    /**
+     * Lists one page of objects (or common prefixes) in the S3 bucket with the specified prefix.
+     *
+     * <p>Pass {@code null} as {@code continuationToken} to start from the beginning.
+     * When the returned {@link ListPage#continuationToken()} is non-null, pass it back
+     * to retrieve the next page.  Results on each page are returned in alphabetical order.
+     *
+     * <p>When {@code delimiter} is {@code null}, the page contains object keys parsed from
+     * {@code <Contents>} elements.  When {@code delimiter} is non-null (e.g. {@code "/"}),
+     * it is sent as the S3 {@code delimiter} query parameter and the page contains common
+     * prefixes parsed from {@code <CommonPrefixes>} elements instead.
+     *
+     * @param prefix            the prefix to filter by; use an empty string to list all
+     * @param continuationToken token from the previous page, or {@code null} for the first page
+     * @param delimiter         S3 grouping delimiter, or {@code null} for a flat object listing
+     * @param maxResults        maximum number of results to return (1–1000)
+     * @return a page of keys (or common prefixes) and an optional token for the next page
+     * @throws S3ResponseException if a non-200 response is received from S3
+     * @throws IOException         if an error occurs while reading the response body
+     */
+    public ListPage listObjectsPage(
+            @NonNull final String prefix,
+            @Nullable final String continuationToken,
+            @Nullable final String delimiter,
+            final int maxResults)
+            throws S3ResponseException, IOException {
+        Objects.requireNonNull(prefix);
+        Preconditions.requireInRange(maxResults, LIST_OBJECTS_MIN, LIST_OBJECTS_MAX);
+        final String url = endpoint + bucketName + "/?"
+                + buildListPageQueryString(prefix, maxResults, delimiter, continuationToken);
+        final HttpResponse<InputStream> response =
+                request(url, GET, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
+        final int responseStatusCode = response.statusCode();
+        try (final InputStream in = response.body()) {
+            if (responseStatusCode != 200) {
+                final String formattedPrefix = StringUtilities.isBlank(prefix) ? "BLANK_PREFIX" : prefix;
+                final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
+                final HttpHeaders responseHeaders = response.headers();
+                final String message = "Unsuccessful listing of objects: prefix=%s, maxResults=%s"
+                        .formatted(formattedPrefix, maxResults);
+                throw new S3ResponseException(responseStatusCode, responseBody, responseHeaders, message);
+            } else {
+                final Document document = parseDocument(in);
+                final String outerTag = delimiter != null ? "CommonPrefixes" : "Contents";
+                final String innerTag = delimiter != null ? "Prefix" : "Key";
+                final List<String> results = extractChildText(document.getElementsByTagName(outerTag), innerTag);
+                final NodeList tokenNodes = document.getElementsByTagName("NextContinuationToken");
+                final String nextToken =
+                        tokenNodes.getLength() > 0 ? tokenNodes.item(0).getTextContent() : null;
+                return new ListPage(results, nextToken);
+            }
+        }
+    }
+
+    /**
+     * Builds the canonical query string for a list-objects-v2 request.
+     *
+     * @param prefix            prefix filter
+     * @param maxResults        maximum keys to return
+     * @param delimiter         grouping delimiter, or {@code null} for a flat listing
+     * @param continuationToken pagination token from a previous page, or {@code null}
+     * @return the assembled query string (not URL-encoded as a whole; individual values are encoded)
+     */
+    private static String buildListPageQueryString(
+            final String prefix,
+            final int maxResults,
+            @Nullable final String delimiter,
+            @Nullable final String continuationToken) {
+        final StringBuilder queryString = new StringBuilder("list-type=2&max-keys=")
+                .append(maxResults)
+                .append("&prefix=")
+                .append(prefix);
+        if (delimiter != null) {
+            queryString.append("&delimiter=").append(URLEncoder.encode(delimiter, StandardCharsets.UTF_8));
+        }
+        if (continuationToken != null) {
+            queryString
+                    .append("&continuation-token=")
+                    .append(URLEncoder.encode(continuationToken, StandardCharsets.UTF_8));
+        }
+        return queryString.toString();
+    }
+
+    /**
+     * Extracts the text content of the first {@code childTag} element found inside each element of
+     * {@code parentNodes}, skipping any parent that does not contain the child tag.
+     *
+     * @param parentNodes the list of parent elements to iterate over
+     * @param childTag    the tag name of the child element whose text content is wanted
+     * @return a mutable list of text values, in document order
+     */
+    private List<String> extractChildText(final NodeList parentNodes, final String childTag) {
+        final List<String> result = new ArrayList<>();
+        for (int i = 0; i < parentNodes.getLength(); i++) {
+            final NodeList children = ((Element) parentNodes.item(i)).getElementsByTagName(childTag);
+            if (children.getLength() > 0) {
+                result.add(children.item(0).getTextContent());
+            }
+        }
+        return result;
     }
 
     /**
@@ -414,6 +511,32 @@ public final class S3Client implements AutoCloseable {
     }
 
     /**
+     * Deletes an object from the S3 bucket.
+     *
+     * @param key the object key to delete. Cannot be blank
+     * @throws S3ResponseException if a non-204 response is received from S3
+     * @throws IOException if an error occurs while reading the response body in case of non-204 response
+     */
+    public void deleteObject(@NonNull final String key) throws S3ResponseException, IOException {
+        Preconditions.requireNotBlank(key);
+        final String url = endpoint + bucketName + "/" + key;
+        final HttpResponse<InputStream> response =
+                request(url, DELETE, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
+        final int responseStatusCode = response.statusCode();
+        try (final InputStream in = response.body()) {
+            if (responseStatusCode != 204) {
+                final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
+                final HttpHeaders responseHeaders = response.headers();
+                throw new S3ResponseException(
+                        responseStatusCode,
+                        responseBody,
+                        responseHeaders,
+                        "Failed to remove object: key=%s".formatted(key));
+            }
+        }
+    }
+
+    /**
      * Creates a multipart upload for the specified object key.
      *
      * @param key The object key. Cannot be null
@@ -544,6 +667,137 @@ public final class S3Client implements AutoCloseable {
             }
         }
     }
+
+    /**
+     * Lists the parts that have already been uploaded for an in-progress multipart upload.
+     *
+     * @param key the object key of the multipart upload. Cannot be blank
+     * @param uploadId the upload ID returned by {@link #createMultipartUpload}. Cannot be blank
+     * @return the parts uploaded so far, sorted by part number; empty if no parts have been uploaded
+     * @throws S3ResponseException if a non-200 response is received from S3
+     * @throws IOException if an error occurs while reading the response body
+     */
+    @NonNull
+    public List<PartInfo> listParts(@NonNull final String key, @NonNull final String uploadId)
+            throws S3ResponseException, IOException {
+        Preconditions.requireNotBlank(key);
+        Preconditions.requireNotBlank(uploadId);
+        final String canonicalQueryString = "max-parts=1000&uploadId=" + uploadId;
+        final String url = endpoint + bucketName + "/" + urlEncode(key, true) + "?" + canonicalQueryString;
+        final HttpResponse<InputStream> response =
+                request(url, GET, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
+        final int responseStatusCode = response.statusCode();
+        try (final InputStream in = response.body()) {
+            if (responseStatusCode != 200) {
+                final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
+                final HttpHeaders responseHeaders = response.headers();
+                final String message = "Failed to list parts: key=%s, uploadId=%s".formatted(key, uploadId);
+                throw new S3ResponseException(responseStatusCode, responseBody, responseHeaders, message);
+            }
+            final SortedMap<Integer, PartInfo> parts = new ConcurrentSkipListMap<>();
+            final NodeList partNodes = parseDocument(in).getElementsByTagName("Part");
+            for (int i = 0; i < partNodes.getLength(); i++) {
+                final Element part = (Element) partNodes.item(i);
+                final int partNumber = Integer.parseInt(
+                        part.getElementsByTagName("PartNumber").item(0).getTextContent());
+                final long size =
+                        Long.parseLong(part.getElementsByTagName("Size").item(0).getTextContent());
+                final String etag = part.getElementsByTagName("ETag").item(0).getTextContent();
+                parts.put(partNumber, new PartInfo(partNumber, size, etag));
+            }
+            return parts.values().stream().toList();
+        }
+    }
+
+    /**
+     * Copies a byte range from an existing S3 object into a part of a new multipart upload.
+     * This is a server-side copy — no data is transferred through the client.
+     *
+     * @param sourceKey  the key of the object to copy from. Cannot be blank
+     * @param startByte  the first byte of the range to copy (inclusive, 0-based)
+     * @param endByte    the last byte of the range to copy (inclusive)
+     * @param destKey    the key of the multipart upload target. Cannot be blank
+     * @param uploadId   the upload ID of the target multipart upload. Cannot be blank
+     * @param partNumber the 1-based part number within the target upload
+     * @return the ETag of the newly created part
+     * @throws S3ResponseException if a non-200 response is received from S3
+     * @throws IOException if an error occurs while reading the response body
+     */
+    @NonNull
+    public String uploadPartCopy(
+            @NonNull final String sourceKey,
+            final long startByte,
+            final long endByte,
+            @NonNull final String destKey,
+            @NonNull final String uploadId,
+            final int partNumber)
+            throws S3ResponseException, IOException {
+        Preconditions.requireNotBlank(sourceKey);
+        Preconditions.requireNotBlank(destKey);
+        Preconditions.requireNotBlank(uploadId);
+        final String canonicalQueryString = "partNumber=" + partNumber + "&uploadId=" + uploadId;
+        final Map<String, String> headers = new HashMap<>();
+        headers.put("x-amz-copy-source", "/" + bucketName + "/" + urlEncode(sourceKey, true));
+        headers.put("x-amz-copy-source-range", "bytes=" + startByte + "-" + endByte);
+        final String url = endpoint + bucketName + "/" + urlEncode(destKey, true) + "?" + canonicalQueryString;
+        final HttpResponse<InputStream> response = request(url, PUT, headers, null, BodyHandlers.ofInputStream());
+        final int responseStatusCode = response.statusCode();
+        try (final InputStream in = response.body()) {
+            if (responseStatusCode != 200) {
+                final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
+                final HttpHeaders responseHeaders = response.headers();
+                final String message = "Failed to copy part: sourceKey=%s, destKey=%s, uploadId=%s, partNumber=%d"
+                        .formatted(sourceKey, destKey, uploadId, partNumber);
+                throw new S3ResponseException(responseStatusCode, responseBody, responseHeaders, message);
+            }
+            return parseDocument(in).getElementsByTagName("ETag").item(0).getTextContent();
+        }
+    }
+
+    /**
+     * Downloads a byte range of an S3 object into memory.
+     *
+     * @param key       the object key. Cannot be blank
+     * @param startByte the first byte of the range to download (inclusive, 0-based)
+     * @param endByte   the last byte of the range to download (inclusive)
+     * @return the requested bytes
+     * @throws S3ResponseException if a non-206/200 response is received from S3
+     * @throws IOException if an error occurs while reading the response body
+     */
+    @NonNull
+    public byte[] downloadObjectRange(@NonNull final String key, final long startByte, final long endByte)
+            throws S3ResponseException, IOException {
+        Preconditions.requireNotBlank(key);
+        final Map<String, String> headers = new HashMap<>();
+        headers.put("Range", "bytes=" + startByte + "-" + endByte);
+        final String url = endpoint + bucketName + "/" + urlEncode(key, true);
+        final HttpResponse<byte[]> response = request(url, GET, headers, null, BodyHandlers.ofByteArray());
+        final int responseStatusCode = response.statusCode();
+        if (responseStatusCode == 206 || responseStatusCode == 200) {
+            return response.body();
+        }
+        final String message =
+                "Failed to download object range: key=%s, range=%d-%d".formatted(key, startByte, endByte);
+        throw new S3ResponseException(responseStatusCode, null, response.headers(), message);
+    }
+
+    /**
+     * Carries the metadata of one part in an in-progress multipart upload.
+     *
+     * @param partNumber the 1-based part number
+     * @param size       the size of the part in bytes
+     * @param etag       the ETag returned by S3 when the part was uploaded
+     */
+    public record PartInfo(int partNumber, long size, String etag) {}
+
+    /**
+     * Carries one page of S3 list results plus an optional continuation token for the next page.
+     *
+     * @param keys                the object keys (or common prefixes) returned in this page
+     * @param continuationToken   token to pass to the next call to retrieve the following page;
+     *                            {@code null} when this is the last page
+     */
+    public record ListPage(List<String> keys, @Nullable String continuationToken) {}
 
     /**
      * Performs an HTTP request to S3 to the specified URL with the given parameters.
@@ -685,7 +939,7 @@ public final class S3Client implements AutoCloseable {
         // determine host header
         String hostHeader = endpointUrl.getHost();
         final int port = endpointUrl.getPort();
-        if (port > -1) {
+        if (port >= 0) {
             hostHeader = hostHeader.concat(":" + port);
         }
         // update the host header
