@@ -12,6 +12,7 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
@@ -40,12 +41,14 @@ class S3ClientRetryTest {
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" + "<Error><Code>%s</Code><Message>test</Message></Error>";
 
     private HttpServer httpServer;
+    private ExecutorService serverExecutor;
     private String serverUrl;
 
     @BeforeEach
     void startServer() throws IOException {
         httpServer = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
-        httpServer.setExecutor(Executors.newCachedThreadPool());
+        serverExecutor = Executors.newCachedThreadPool();
+        httpServer.setExecutor(serverExecutor);
         httpServer.start();
         serverUrl = "http://localhost:" + httpServer.getAddress().getPort() + "/";
     }
@@ -54,6 +57,9 @@ class S3ClientRetryTest {
     void stopServer() {
         if (httpServer != null) {
             httpServer.stop(0);
+        }
+        if (serverExecutor != null) {
+            serverExecutor.shutdownNow();
         }
     }
 
@@ -118,12 +124,7 @@ class S3ClientRetryTest {
     void retriesOn503ThenSucceeds() throws Exception {
         final AtomicInteger counter = registerCountingHandler(503, 2, xmlError("SlowDown"));
 
-        try (final S3Client client = clientWith(RetryPolicy.builder()
-                .maxAttempts(4)
-                .baseDelayMs(1)
-                .maxDelayMs(5)
-                .totalTimeoutMs(10_000)
-                .build())) {
+        try (final S3Client client = clientWith(new RetryPolicy(4, 1, 5, 10_000, 0))) {
             client.listObjects("", 10);
         }
 
@@ -134,12 +135,7 @@ class S3ClientRetryTest {
     void retriesOn429ThenSucceeds() throws Exception {
         final AtomicInteger counter = registerCountingHandler(429, 1, xmlError("TooManyRequests"));
 
-        try (final S3Client client = clientWith(RetryPolicy.builder()
-                .maxAttempts(3)
-                .baseDelayMs(1)
-                .maxDelayMs(5)
-                .totalTimeoutMs(10_000)
-                .build())) {
+        try (final S3Client client = clientWith(new RetryPolicy(3, 1, 5, 10_000, 0))) {
             client.listObjects("", 10);
         }
 
@@ -150,12 +146,7 @@ class S3ClientRetryTest {
     void retriesOn408ThenSucceeds() throws Exception {
         final AtomicInteger counter = registerCountingHandler(408, 1, xmlError("RequestTimeout"));
 
-        try (final S3Client client = clientWith(RetryPolicy.builder()
-                .maxAttempts(3)
-                .baseDelayMs(1)
-                .maxDelayMs(5)
-                .totalTimeoutMs(10_000)
-                .build())) {
+        try (final S3Client client = clientWith(new RetryPolicy(3, 1, 5, 10_000, 0))) {
             client.listObjects("", 10);
         }
 
@@ -166,12 +157,7 @@ class S3ClientRetryTest {
     void retriesOn409ThenSucceeds() throws Exception {
         final AtomicInteger counter = registerCountingHandler(409, 1, xmlError("OperationAborted"));
 
-        try (final S3Client client = clientWith(RetryPolicy.builder()
-                .maxAttempts(3)
-                .baseDelayMs(1)
-                .maxDelayMs(5)
-                .totalTimeoutMs(10_000)
-                .build())) {
+        try (final S3Client client = clientWith(new RetryPolicy(3, 1, 5, 10_000, 0))) {
             client.listObjects("", 10);
         }
 
@@ -182,12 +168,7 @@ class S3ClientRetryTest {
     void retriesOn500ThenSucceeds() throws Exception {
         final AtomicInteger counter = registerCountingHandler(500, 1, xmlError("InternalError"));
 
-        try (final S3Client client = clientWith(RetryPolicy.builder()
-                .maxAttempts(3)
-                .baseDelayMs(1)
-                .maxDelayMs(5)
-                .totalTimeoutMs(10_000)
-                .build())) {
+        try (final S3Client client = clientWith(new RetryPolicy(3, 1, 5, 10_000, 0))) {
             client.listObjects("", 10);
         }
 
@@ -198,12 +179,7 @@ class S3ClientRetryTest {
     void noRetryOn403() throws Exception {
         final AtomicInteger counter = registerAlwaysErrorHandler(403, xmlError("AccessDenied"));
 
-        try (final S3Client client = clientWith(RetryPolicy.builder()
-                .maxAttempts(4)
-                .baseDelayMs(1)
-                .maxDelayMs(5)
-                .totalTimeoutMs(10_000)
-                .build())) {
+        try (final S3Client client = clientWith(new RetryPolicy(4, 1, 5, 10_000, 0))) {
             assertThatThrownBy(() -> client.listObjects("", 10))
                     .isInstanceOf(S3ResponseException.class)
                     .satisfies(e -> assertThat(((S3ResponseException) e).getResponseStatusCode())
@@ -217,12 +193,7 @@ class S3ClientRetryTest {
     void noRetryOn404ForDownloadTextFile() throws Exception {
         final AtomicInteger counter = registerAlwaysErrorHandler(404, new byte[0]);
 
-        try (final S3Client client = clientWith(RetryPolicy.builder()
-                .maxAttempts(4)
-                .baseDelayMs(1)
-                .maxDelayMs(5)
-                .totalTimeoutMs(10_000)
-                .build())) {
+        try (final S3Client client = clientWith(new RetryPolicy(4, 1, 5, 10_000, 0))) {
             final String result = client.downloadTextFile("non-existent-key");
             assertThat(result).isNull();
         }
@@ -234,12 +205,7 @@ class S3ClientRetryTest {
     void retriesOn400WithRequestTimeTooSkewed() throws Exception {
         final AtomicInteger counter = registerCountingHandler(400, 1, xmlError("RequestTimeTooSkewed"));
 
-        try (final S3Client client = clientWith(RetryPolicy.builder()
-                .maxAttempts(3)
-                .baseDelayMs(1)
-                .maxDelayMs(5)
-                .totalTimeoutMs(10_000)
-                .build())) {
+        try (final S3Client client = clientWith(new RetryPolicy(3, 1, 5, 10_000, 0))) {
             client.listObjects("", 10);
         }
 
@@ -250,12 +216,7 @@ class S3ClientRetryTest {
     void retriesOn400WithExpiredToken() throws Exception {
         final AtomicInteger counter = registerCountingHandler(400, 1, xmlError("ExpiredToken"));
 
-        try (final S3Client client = clientWith(RetryPolicy.builder()
-                .maxAttempts(3)
-                .baseDelayMs(1)
-                .maxDelayMs(5)
-                .totalTimeoutMs(10_000)
-                .build())) {
+        try (final S3Client client = clientWith(new RetryPolicy(3, 1, 5, 10_000, 0))) {
             client.listObjects("", 10);
         }
 
@@ -266,12 +227,7 @@ class S3ClientRetryTest {
     void retriesOn400WithBadDigest() throws Exception {
         final AtomicInteger counter = registerCountingHandler(400, 1, xmlError("BadDigest"));
 
-        try (final S3Client client = clientWith(RetryPolicy.builder()
-                .maxAttempts(3)
-                .baseDelayMs(1)
-                .maxDelayMs(5)
-                .totalTimeoutMs(10_000)
-                .build())) {
+        try (final S3Client client = clientWith(new RetryPolicy(3, 1, 5, 10_000, 0))) {
             client.listObjects("", 10);
         }
 
@@ -282,12 +238,7 @@ class S3ClientRetryTest {
     void retriesOn400WithRequestTimeout() throws Exception {
         final AtomicInteger counter = registerCountingHandler(400, 1, xmlError("RequestTimeout"));
 
-        try (final S3Client client = clientWith(RetryPolicy.builder()
-                .maxAttempts(3)
-                .baseDelayMs(1)
-                .maxDelayMs(5)
-                .totalTimeoutMs(10_000)
-                .build())) {
+        try (final S3Client client = clientWith(new RetryPolicy(3, 1, 5, 10_000, 0))) {
             client.listObjects("", 10);
         }
 
@@ -298,12 +249,7 @@ class S3ClientRetryTest {
     void noRetryOn400WithUnknownErrorCode() throws Exception {
         final AtomicInteger counter = registerAlwaysErrorHandler(400, xmlError("InvalidBucketName"));
 
-        try (final S3Client client = clientWith(RetryPolicy.builder()
-                .maxAttempts(4)
-                .baseDelayMs(1)
-                .maxDelayMs(5)
-                .totalTimeoutMs(10_000)
-                .build())) {
+        try (final S3Client client = clientWith(new RetryPolicy(4, 1, 5, 10_000, 0))) {
             assertThatThrownBy(() -> client.listObjects("", 10))
                     .isInstanceOf(S3ResponseException.class)
                     .satisfies(e -> assertThat(((S3ResponseException) e).getResponseStatusCode())
@@ -318,12 +264,7 @@ class S3ClientRetryTest {
         final AtomicInteger counter =
                 registerAlwaysErrorHandler(400, "plain text error".getBytes(StandardCharsets.UTF_8));
 
-        try (final S3Client client = clientWith(RetryPolicy.builder()
-                .maxAttempts(4)
-                .baseDelayMs(1)
-                .maxDelayMs(5)
-                .totalTimeoutMs(10_000)
-                .build())) {
+        try (final S3Client client = clientWith(new RetryPolicy(4, 1, 5, 10_000, 0))) {
             assertThatThrownBy(() -> client.listObjects("", 10))
                     .isInstanceOf(S3ResponseException.class)
                     .satisfies(e -> assertThat(((S3ResponseException) e).getResponseStatusCode())
@@ -337,12 +278,7 @@ class S3ClientRetryTest {
     void exhaustsMaxAttemptsAndThrows() throws Exception {
         final AtomicInteger counter = registerAlwaysErrorHandler(503, xmlError("SlowDown"));
 
-        try (final S3Client client = clientWith(RetryPolicy.builder()
-                .maxAttempts(3)
-                .baseDelayMs(1)
-                .maxDelayMs(5)
-                .totalTimeoutMs(10_000)
-                .build())) {
+        try (final S3Client client = clientWith(new RetryPolicy(3, 1, 5, 10_000, 0))) {
             assertThatThrownBy(() -> client.listObjects("", 10))
                     .isInstanceOf(S3ResponseException.class)
                     .satisfies(e -> assertThat(((S3ResponseException) e).getResponseStatusCode())
@@ -380,12 +316,7 @@ class S3ClientRetryTest {
             sendResponse(exchange, 503, xmlError("SlowDown"));
         });
 
-        try (final S3Client client = clientWith(RetryPolicy.builder()
-                .maxAttempts(20)
-                .baseDelayMs(1)
-                .maxDelayMs(5)
-                .totalTimeoutMs(200) // only 200 ms budget
-                .build())) {
+        try (final S3Client client = clientWith(new RetryPolicy(20, 1, 5, 200, 0))) {
             assertThatThrownBy(() -> client.listObjects("", 10)).isInstanceOf(S3ResponseException.class);
         }
 
@@ -407,13 +338,7 @@ class S3ClientRetryTest {
             sendResponse(exchange, 200, LIST_200_BODY.getBytes(StandardCharsets.UTF_8));
         });
 
-        try (final S3Client client = clientWith(RetryPolicy.builder()
-                .maxAttempts(2)
-                .baseDelayMs(1)
-                .maxDelayMs(5)
-                .totalTimeoutMs(5_000)
-                .requestTimeoutMs(100) // 100 ms per request — will time out
-                .build())) {
+        try (final S3Client client = clientWith(new RetryPolicy(2, 1, 5, 5_000, 100))) {
             // Both attempts will time out; expect the HttpTimeoutException to propagate as IOException
             assertThatThrownBy(() -> client.listObjects("", 10)).isInstanceOf(HttpTimeoutException.class);
         }
@@ -438,12 +363,7 @@ class S3ClientRetryTest {
 
         // We just verify it doesn't throw and that 2 attempts were made (i.e. header was captured,
         // retry happened). Full log-output capture would require a custom LoggerFinder — out of scope.
-        try (final S3Client client = clientWith(RetryPolicy.builder()
-                .maxAttempts(3)
-                .baseDelayMs(1)
-                .maxDelayMs(5)
-                .totalTimeoutMs(10_000)
-                .build())) {
+        try (final S3Client client = clientWith(new RetryPolicy(3, 1, 5, 10_000, 0))) {
             client.listObjects("", 10);
         }
 
@@ -466,12 +386,7 @@ class S3ClientRetryTest {
             }
         });
 
-        try (final S3Client client = clientWith(RetryPolicy.builder()
-                .maxAttempts(3)
-                .baseDelayMs(1)
-                .maxDelayMs(5)
-                .totalTimeoutMs(10_000)
-                .build())) {
+        try (final S3Client client = clientWith(new RetryPolicy(3, 1, 5, 10_000, 0))) {
             final byte[] result = client.downloadObjectRange("some-key", 0, 4);
             assertThat(result).isEqualTo(new byte[] {1, 2, 3, 4, 5});
         }
