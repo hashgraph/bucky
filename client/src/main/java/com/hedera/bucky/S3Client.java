@@ -44,6 +44,7 @@ import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.locks.LockSupport;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import javax.crypto.Mac;
@@ -208,18 +209,11 @@ public final class S3Client implements AutoCloseable {
      * @throws IOException if an error occurs while reading the response body
      */
     public List<String> listObjects(@NonNull final String prefix, final int maxResults)
-            throws S3ResponseException, IOException, InterruptedException {
+            throws S3ResponseException, IOException {
         Objects.requireNonNull(prefix);
         Preconditions.requireInRange(maxResults, LIST_OBJECTS_MIN, LIST_OBJECTS_MAX);
         final long deadlineNanos = System.nanoTime() + retryPolicy.totalTimeoutMs() * 1_000_000L;
-        Exception lastException = null;
         for (int attempt = 0; attempt < retryPolicy.maxAttempts(); attempt++) {
-            if (attempt > 0) {
-                sleepBeforeRetry(attempt, deadlineNanos);
-                if (System.nanoTime() >= deadlineNanos) {
-                    break;
-                }
-            }
             try {
                 final String canonicalQueryString = "list-type=2&prefix=" + prefix + "&max-keys=" + maxResults;
                 final String url = endpoint + bucketName + "/?" + canonicalQueryString;
@@ -241,22 +235,23 @@ public final class S3Client implements AutoCloseable {
                 if (!canRetryNetworkError(networkEx, attempt, deadlineNanos)) {
                     throw networkEx.getCause();
                 }
-                lastException = networkEx.getCause();
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw networkEx.getCause();
+                }
             } catch (final S3ResponseException responseEx) {
                 if (!canRetryResponseError(responseEx, attempt, deadlineNanos)) {
                     throw responseEx;
                 }
-                lastException = responseEx;
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw responseEx;
+                }
             }
         }
 
-        if (lastException instanceof final S3ResponseException sre) {
-            throw sre;
-        } else if (lastException instanceof final IOException ioe) {
-            throw ioe;
-        } else {
-            throw new RuntimeException("unexpected exception type: " + lastException);
-        }
+        // unreachable — RetryPolicy validates maxAttempts >= 1, so the last iteration always returns or throws
+        return null;
     }
 
     /**
@@ -284,18 +279,11 @@ public final class S3Client implements AutoCloseable {
             @Nullable final String continuationToken,
             @Nullable final String delimiter,
             final int maxResults)
-            throws S3ResponseException, IOException, InterruptedException {
+            throws S3ResponseException, IOException {
         Objects.requireNonNull(prefix);
         Preconditions.requireInRange(maxResults, LIST_OBJECTS_MIN, LIST_OBJECTS_MAX);
         final long deadlineNanos = System.nanoTime() + retryPolicy.totalTimeoutMs() * 1_000_000L;
-        Exception lastException = null;
         for (int attempt = 0; attempt < retryPolicy.maxAttempts(); attempt++) {
-            if (attempt > 0) {
-                sleepBeforeRetry(attempt, deadlineNanos);
-                if (System.nanoTime() >= deadlineNanos) {
-                    break;
-                }
-            }
             try {
                 final String url = endpoint + bucketName + "/?"
                         + buildListPageQueryString(prefix, maxResults, delimiter, continuationToken);
@@ -322,19 +310,20 @@ public final class S3Client implements AutoCloseable {
                 }
             } catch (final UncheckedIOException networkEx) {
                 if (!canRetryNetworkError(networkEx, attempt, deadlineNanos)) throw networkEx.getCause();
-                lastException = networkEx.getCause();
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw networkEx.getCause();
+                }
             } catch (final S3ResponseException responseEx) {
                 if (!canRetryResponseError(responseEx, attempt, deadlineNanos)) throw responseEx;
-                lastException = responseEx;
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw responseEx;
+                }
             }
         }
-        if (lastException instanceof final S3ResponseException sre) {
-            throw sre;
-        } else if (lastException instanceof final IOException ioe) {
-            throw ioe;
-        } else {
-            throw new RuntimeException("unexpected exception type: " + lastException);
-        }
+        // unreachable — RetryPolicy validates maxAttempts >= 1, so the last iteration always returns or throws
+        return null;
     }
 
     /**
@@ -348,20 +337,13 @@ public final class S3Client implements AutoCloseable {
      */
     public void uploadTextFile(
             @NonNull final String objectKey, @NonNull final String storageClass, @NonNull final String content)
-            throws S3ResponseException, IOException, InterruptedException {
+            throws S3ResponseException, IOException {
         Preconditions.requireNotBlank(objectKey);
         Preconditions.requireNotBlank(storageClass);
         Preconditions.requireNotBlank(content);
         final byte[] contentData = content.getBytes(StandardCharsets.UTF_8);
         final long deadlineNanos = System.nanoTime() + retryPolicy.totalTimeoutMs() * 1_000_000L;
-        Exception lastException = null;
         for (int attempt = 0; attempt < retryPolicy.maxAttempts(); attempt++) {
-            if (attempt > 0) {
-                sleepBeforeRetry(attempt, deadlineNanos);
-                if (System.nanoTime() >= deadlineNanos) {
-                    break;
-                }
-            }
             try {
                 final Map<String, String> headers = new HashMap<>();
                 headers.put("content-length", Integer.toString(contentData.length));
@@ -383,18 +365,17 @@ public final class S3Client implements AutoCloseable {
                 return;
             } catch (final UncheckedIOException networkEx) {
                 if (!canRetryNetworkError(networkEx, attempt, deadlineNanos)) throw networkEx.getCause();
-                lastException = networkEx.getCause();
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw networkEx.getCause();
+                }
             } catch (final S3ResponseException responseEx) {
                 if (!canRetryResponseError(responseEx, attempt, deadlineNanos)) throw responseEx;
-                lastException = responseEx;
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw responseEx;
+                }
             }
-        }
-        if (lastException instanceof final S3ResponseException sre) {
-            throw sre;
-        } else if (lastException instanceof final IOException ioe) {
-            throw ioe;
-        } else {
-            throw new RuntimeException("unexpected exception type: " + lastException);
         }
     }
 
@@ -406,18 +387,10 @@ public final class S3Client implements AutoCloseable {
      * @throws S3ResponseException if a non-200 response is received from S3 during file download
      * @throws IOException if an error occurs while reading the response body in case of non 200 response
      */
-    public String downloadTextFile(@NonNull final String key)
-            throws S3ResponseException, IOException, InterruptedException {
+    public String downloadTextFile(@NonNull final String key) throws S3ResponseException, IOException {
         Preconditions.requireNotBlank(key);
         final long deadlineNanos = System.nanoTime() + retryPolicy.totalTimeoutMs() * 1_000_000L;
-        Exception lastException = null;
         for (int attempt = 0; attempt < retryPolicy.maxAttempts(); attempt++) {
-            if (attempt > 0) {
-                sleepBeforeRetry(attempt, deadlineNanos);
-                if (System.nanoTime() >= deadlineNanos) {
-                    break;
-                }
-            }
             try {
                 final String url = endpoint + bucketName + "/" + urlEncode(key, true);
                 final HttpResponse<InputStream> response =
@@ -437,19 +410,20 @@ public final class S3Client implements AutoCloseable {
                 }
             } catch (final UncheckedIOException networkEx) {
                 if (!canRetryNetworkError(networkEx, attempt, deadlineNanos)) throw networkEx.getCause();
-                lastException = networkEx.getCause();
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw networkEx.getCause();
+                }
             } catch (final S3ResponseException responseEx) {
                 if (!canRetryResponseError(responseEx, attempt, deadlineNanos)) throw responseEx;
-                lastException = responseEx;
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw responseEx;
+                }
             }
         }
-        if (lastException instanceof final S3ResponseException sre) {
-            throw sre;
-        } else if (lastException instanceof final IOException ioe) {
-            throw ioe;
-        } else {
-            throw new RuntimeException("unexpected exception type: " + lastException);
-        }
+        // unreachable — RetryPolicy validates maxAttempts >= 1, so the last iteration always returns or throws
+        return null;
     }
 
     /**
@@ -467,7 +441,7 @@ public final class S3Client implements AutoCloseable {
             @NonNull final String storageClass,
             @NonNull final Iterator<byte[]> contentIterable,
             @NonNull final String contentType)
-            throws S3ResponseException, IOException, InterruptedException {
+            throws S3ResponseException, IOException {
         // start the multipart upload
         final String uploadId = createMultipartUpload(objectKey, storageClass, contentType);
         // create a list to store the ETags of the uploaded parts
@@ -523,17 +497,9 @@ public final class S3Client implements AutoCloseable {
      * @throws IOException if an error occurs while reading the response body
      */
     @NonNull
-    public Map<String, List<String>> listMultipartUploads()
-            throws S3ResponseException, IOException, InterruptedException {
+    public Map<String, List<String>> listMultipartUploads() throws S3ResponseException, IOException {
         final long deadlineNanos = System.nanoTime() + retryPolicy.totalTimeoutMs() * 1_000_000L;
-        Exception lastException = null;
         for (int attempt = 0; attempt < retryPolicy.maxAttempts(); attempt++) {
-            if (attempt > 0) {
-                sleepBeforeRetry(attempt, deadlineNanos);
-                if (System.nanoTime() >= deadlineNanos) {
-                    break;
-                }
-            }
             try {
                 final String url = endpoint + bucketName + "/" + "?" + "uploads=";
                 final HttpResponse<InputStream> response =
@@ -566,19 +532,20 @@ public final class S3Client implements AutoCloseable {
                 }
             } catch (final UncheckedIOException networkEx) {
                 if (!canRetryNetworkError(networkEx, attempt, deadlineNanos)) throw networkEx.getCause();
-                lastException = networkEx.getCause();
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw networkEx.getCause();
+                }
             } catch (final S3ResponseException responseEx) {
                 if (!canRetryResponseError(responseEx, attempt, deadlineNanos)) throw responseEx;
-                lastException = responseEx;
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw responseEx;
+                }
             }
         }
-        if (lastException instanceof final S3ResponseException sre) {
-            throw sre;
-        } else if (lastException instanceof final IOException ioe) {
-            throw ioe;
-        } else {
-            throw new RuntimeException("unexpected exception type: " + lastException);
-        }
+        // unreachable — RetryPolicy validates maxAttempts >= 1, so the last iteration always returns or throws
+        return null;
     }
 
     /**
@@ -590,18 +557,11 @@ public final class S3Client implements AutoCloseable {
      * @throws IOException if an error occurs while reading the response body in case of non-204 response
      */
     public void abortMultipartUpload(@NonNull final String key, @NonNull final String uploadId)
-            throws S3ResponseException, IOException, InterruptedException {
+            throws S3ResponseException, IOException {
         Preconditions.requireNotBlank(key);
         Preconditions.requireNotBlank(uploadId);
         final long deadlineNanos = System.nanoTime() + retryPolicy.totalTimeoutMs() * 1_000_000L;
-        Exception lastException = null;
         for (int attempt = 0; attempt < retryPolicy.maxAttempts(); attempt++) {
-            if (attempt > 0) {
-                sleepBeforeRetry(attempt, deadlineNanos);
-                if (System.nanoTime() >= deadlineNanos) {
-                    break;
-                }
-            }
             try {
                 final String url = endpoint + bucketName + "/" + key + "?" + "uploadId=" + uploadId;
                 final HttpResponse<InputStream> response =
@@ -619,18 +579,17 @@ public final class S3Client implements AutoCloseable {
                 return;
             } catch (final UncheckedIOException networkEx) {
                 if (!canRetryNetworkError(networkEx, attempt, deadlineNanos)) throw networkEx.getCause();
-                lastException = networkEx.getCause();
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw networkEx.getCause();
+                }
             } catch (final S3ResponseException responseEx) {
                 if (!canRetryResponseError(responseEx, attempt, deadlineNanos)) throw responseEx;
-                lastException = responseEx;
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw responseEx;
+                }
             }
-        }
-        if (lastException instanceof final S3ResponseException sre) {
-            throw sre;
-        } else if (lastException instanceof final IOException ioe) {
-            throw ioe;
-        } else {
-            throw new RuntimeException("unexpected exception type: " + lastException);
         }
     }
 
@@ -641,17 +600,10 @@ public final class S3Client implements AutoCloseable {
      * @throws S3ResponseException if a non-204 response is received from S3
      * @throws IOException if an error occurs while reading the response body in case of non-204 response
      */
-    public void deleteObject(@NonNull final String key) throws S3ResponseException, IOException, InterruptedException {
+    public void deleteObject(@NonNull final String key) throws S3ResponseException, IOException {
         Preconditions.requireNotBlank(key);
         final long deadlineNanos = System.nanoTime() + retryPolicy.totalTimeoutMs() * 1_000_000L;
-        Exception lastException = null;
         for (int attempt = 0; attempt < retryPolicy.maxAttempts(); attempt++) {
-            if (attempt > 0) {
-                sleepBeforeRetry(attempt, deadlineNanos);
-                if (System.nanoTime() >= deadlineNanos) {
-                    break;
-                }
-            }
             try {
                 final String url = endpoint + bucketName + "/" + key;
                 final HttpResponse<InputStream> response =
@@ -671,18 +623,17 @@ public final class S3Client implements AutoCloseable {
                 return;
             } catch (final UncheckedIOException networkEx) {
                 if (!canRetryNetworkError(networkEx, attempt, deadlineNanos)) throw networkEx.getCause();
-                lastException = networkEx.getCause();
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw networkEx.getCause();
+                }
             } catch (final S3ResponseException responseEx) {
                 if (!canRetryResponseError(responseEx, attempt, deadlineNanos)) throw responseEx;
-                lastException = responseEx;
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw responseEx;
+                }
             }
-        }
-        if (lastException instanceof final S3ResponseException sre) {
-            throw sre;
-        } else if (lastException instanceof final IOException ioe) {
-            throw ioe;
-        } else {
-            throw new RuntimeException("unexpected exception type: " + lastException);
         }
     }
 
@@ -698,16 +649,9 @@ public final class S3Client implements AutoCloseable {
      */
     public String createMultipartUpload(
             @NonNull final String key, @NonNull final String storageClass, @NonNull final String contentType)
-            throws S3ResponseException, IOException, InterruptedException {
+            throws S3ResponseException, IOException {
         final long deadlineNanos = System.nanoTime() + retryPolicy.totalTimeoutMs() * 1_000_000L;
-        Exception lastException = null;
         for (int attempt = 0; attempt < retryPolicy.maxAttempts(); attempt++) {
-            if (attempt > 0) {
-                sleepBeforeRetry(attempt, deadlineNanos);
-                if (System.nanoTime() >= deadlineNanos) {
-                    break;
-                }
-            }
             try {
                 final Map<String, String> headers = new HashMap<>();
                 headers.put("content-type", contentType);
@@ -730,19 +674,20 @@ public final class S3Client implements AutoCloseable {
                 }
             } catch (final UncheckedIOException networkEx) {
                 if (!canRetryNetworkError(networkEx, attempt, deadlineNanos)) throw networkEx.getCause();
-                lastException = networkEx.getCause();
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw networkEx.getCause();
+                }
             } catch (final S3ResponseException responseEx) {
                 if (!canRetryResponseError(responseEx, attempt, deadlineNanos)) throw responseEx;
-                lastException = responseEx;
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw responseEx;
+                }
             }
         }
-        if (lastException instanceof final S3ResponseException sre) {
-            throw sre;
-        } else if (lastException instanceof final IOException ioe) {
-            throw ioe;
-        } else {
-            throw new RuntimeException("unexpected exception type: " + lastException);
-        }
+        // unreachable — RetryPolicy validates maxAttempts >= 1, so the last iteration always returns or throws
+        return null;
     }
 
     /**
@@ -761,16 +706,9 @@ public final class S3Client implements AutoCloseable {
             @NonNull final String uploadId,
             final int partNumber,
             @NonNull final byte[] partData)
-            throws S3ResponseException, IOException, InterruptedException {
+            throws S3ResponseException, IOException {
         final long deadlineNanos = System.nanoTime() + retryPolicy.totalTimeoutMs() * 1_000_000L;
-        Exception lastException = null;
         for (int attempt = 0; attempt < retryPolicy.maxAttempts(); attempt++) {
-            if (attempt > 0) {
-                sleepBeforeRetry(attempt, deadlineNanos);
-                if (System.nanoTime() >= deadlineNanos) {
-                    break;
-                }
-            }
             try {
                 final String canonicalQueryString = "uploadId=" + uploadId + "&partNumber=" + partNumber;
                 final Map<String, String> headers = new HashMap<>();
@@ -793,19 +731,20 @@ public final class S3Client implements AutoCloseable {
                 }
             } catch (final UncheckedIOException networkEx) {
                 if (!canRetryNetworkError(networkEx, attempt, deadlineNanos)) throw networkEx.getCause();
-                lastException = networkEx.getCause();
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw networkEx.getCause();
+                }
             } catch (final S3ResponseException responseEx) {
                 if (!canRetryResponseError(responseEx, attempt, deadlineNanos)) throw responseEx;
-                lastException = responseEx;
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw responseEx;
+                }
             }
         }
-        if (lastException instanceof final S3ResponseException sre) {
-            throw sre;
-        } else if (lastException instanceof final IOException ioe) {
-            throw ioe;
-        } else {
-            throw new RuntimeException("unexpected exception type: " + lastException);
-        }
+        // unreachable — RetryPolicy validates maxAttempts >= 1, so the last iteration always returns or throws
+        return null;
     }
 
     /**
@@ -819,7 +758,7 @@ public final class S3Client implements AutoCloseable {
      */
     public void completeMultipartUpload(
             @NonNull final String key, @NonNull final String uploadId, @NonNull final List<String> eTags)
-            throws S3ResponseException, IOException, InterruptedException {
+            throws S3ResponseException, IOException {
         final StringBuilder sb = new StringBuilder();
         sb.append("<CompleteMultipartUpload>");
         for (int i = 0; i < eTags.size(); i++) {
@@ -832,14 +771,7 @@ public final class S3Client implements AutoCloseable {
         sb.append("</CompleteMultipartUpload>");
         final byte[] requestBody = sb.toString().getBytes(StandardCharsets.UTF_8);
         final long deadlineNanos = System.nanoTime() + retryPolicy.totalTimeoutMs() * 1_000_000L;
-        Exception lastException = null;
         for (int attempt = 0; attempt < retryPolicy.maxAttempts(); attempt++) {
-            if (attempt > 0) {
-                sleepBeforeRetry(attempt, deadlineNanos);
-                if (System.nanoTime() >= deadlineNanos) {
-                    break;
-                }
-            }
             try {
                 final Map<String, String> headers = new HashMap<>();
                 headers.put("content-type", "application/xml");
@@ -859,18 +791,17 @@ public final class S3Client implements AutoCloseable {
                 return;
             } catch (final UncheckedIOException networkEx) {
                 if (!canRetryNetworkError(networkEx, attempt, deadlineNanos)) throw networkEx.getCause();
-                lastException = networkEx.getCause();
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw networkEx.getCause();
+                }
             } catch (final S3ResponseException responseEx) {
                 if (!canRetryResponseError(responseEx, attempt, deadlineNanos)) throw responseEx;
-                lastException = responseEx;
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw responseEx;
+                }
             }
-        }
-        if (lastException instanceof final S3ResponseException sre) {
-            throw sre;
-        } else if (lastException instanceof final IOException ioe) {
-            throw ioe;
-        } else {
-            throw new RuntimeException("unexpected exception type: " + lastException);
         }
     }
 
@@ -885,18 +816,11 @@ public final class S3Client implements AutoCloseable {
      */
     @NonNull
     public List<PartInfo> listParts(@NonNull final String key, @NonNull final String uploadId)
-            throws S3ResponseException, IOException, InterruptedException {
+            throws S3ResponseException, IOException {
         Preconditions.requireNotBlank(key);
         Preconditions.requireNotBlank(uploadId);
         final long deadlineNanos = System.nanoTime() + retryPolicy.totalTimeoutMs() * 1_000_000L;
-        Exception lastException = null;
         for (int attempt = 0; attempt < retryPolicy.maxAttempts(); attempt++) {
-            if (attempt > 0) {
-                sleepBeforeRetry(attempt, deadlineNanos);
-                if (System.nanoTime() >= deadlineNanos) {
-                    break;
-                }
-            }
             try {
                 final String canonicalQueryString = "max-parts=1000&uploadId=" + uploadId;
                 final String url = endpoint + bucketName + "/" + urlEncode(key, true) + "?" + canonicalQueryString;
@@ -926,19 +850,20 @@ public final class S3Client implements AutoCloseable {
                 }
             } catch (final UncheckedIOException networkEx) {
                 if (!canRetryNetworkError(networkEx, attempt, deadlineNanos)) throw networkEx.getCause();
-                lastException = networkEx.getCause();
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw networkEx.getCause();
+                }
             } catch (final S3ResponseException responseEx) {
                 if (!canRetryResponseError(responseEx, attempt, deadlineNanos)) throw responseEx;
-                lastException = responseEx;
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw responseEx;
+                }
             }
         }
-        if (lastException instanceof final S3ResponseException sre) {
-            throw sre;
-        } else if (lastException instanceof final IOException ioe) {
-            throw ioe;
-        } else {
-            throw new RuntimeException("unexpected exception type: " + lastException);
-        }
+        // unreachable — RetryPolicy validates maxAttempts >= 1, so the last iteration always returns or throws
+        return null;
     }
 
     /**
@@ -963,19 +888,12 @@ public final class S3Client implements AutoCloseable {
             @NonNull final String destKey,
             @NonNull final String uploadId,
             final int partNumber)
-            throws S3ResponseException, IOException, InterruptedException {
+            throws S3ResponseException, IOException {
         Preconditions.requireNotBlank(sourceKey);
         Preconditions.requireNotBlank(destKey);
         Preconditions.requireNotBlank(uploadId);
         final long deadlineNanos = System.nanoTime() + retryPolicy.totalTimeoutMs() * 1_000_000L;
-        Exception lastException = null;
         for (int attempt = 0; attempt < retryPolicy.maxAttempts(); attempt++) {
-            if (attempt > 0) {
-                sleepBeforeRetry(attempt, deadlineNanos);
-                if (System.nanoTime() >= deadlineNanos) {
-                    break;
-                }
-            }
             try {
                 final String canonicalQueryString = "partNumber=" + partNumber + "&uploadId=" + uploadId;
                 final Map<String, String> headers = new HashMap<>();
@@ -1001,19 +919,20 @@ public final class S3Client implements AutoCloseable {
                 }
             } catch (final UncheckedIOException networkEx) {
                 if (!canRetryNetworkError(networkEx, attempt, deadlineNanos)) throw networkEx.getCause();
-                lastException = networkEx.getCause();
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw networkEx.getCause();
+                }
             } catch (final S3ResponseException responseEx) {
                 if (!canRetryResponseError(responseEx, attempt, deadlineNanos)) throw responseEx;
-                lastException = responseEx;
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw responseEx;
+                }
             }
         }
-        if (lastException instanceof final S3ResponseException sre) {
-            throw sre;
-        } else if (lastException instanceof final IOException ioe) {
-            throw ioe;
-        } else {
-            throw new RuntimeException("unexpected exception type: " + lastException);
-        }
+        // unreachable — RetryPolicy validates maxAttempts >= 1, so the last iteration always returns or throws
+        return null;
     }
 
     /**
@@ -1028,17 +947,10 @@ public final class S3Client implements AutoCloseable {
      */
     @NonNull
     public byte[] downloadObjectRange(@NonNull final String key, final long startByte, final long endByte)
-            throws S3ResponseException, IOException, InterruptedException {
+            throws S3ResponseException, IOException {
         Preconditions.requireNotBlank(key);
         final long deadlineNanos = System.nanoTime() + retryPolicy.totalTimeoutMs() * 1_000_000L;
-        Exception lastException = null;
         for (int attempt = 0; attempt < retryPolicy.maxAttempts(); attempt++) {
-            if (attempt > 0) {
-                sleepBeforeRetry(attempt, deadlineNanos);
-                if (System.nanoTime() >= deadlineNanos) {
-                    break;
-                }
-            }
             try {
                 final Map<String, String> headers = new HashMap<>();
                 headers.put("Range", "bytes=" + startByte + "-" + endByte);
@@ -1053,19 +965,20 @@ public final class S3Client implements AutoCloseable {
                 throw new S3ResponseException(responseStatusCode, response.body(), response.headers(), message);
             } catch (final UncheckedIOException networkEx) {
                 if (!canRetryNetworkError(networkEx, attempt, deadlineNanos)) throw networkEx.getCause();
-                lastException = networkEx.getCause();
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw networkEx.getCause();
+                }
             } catch (final S3ResponseException responseEx) {
                 if (!canRetryResponseError(responseEx, attempt, deadlineNanos)) throw responseEx;
-                lastException = responseEx;
+                sleepBeforeRetry(attempt, deadlineNanos);
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw responseEx;
+                }
             }
         }
-        if (lastException instanceof final S3ResponseException sre) {
-            throw sre;
-        } else if (lastException instanceof final IOException ioe) {
-            throw ioe;
-        } else {
-            throw new RuntimeException("unexpected exception type: " + lastException);
-        }
+        // unreachable — RetryPolicy validates maxAttempts >= 1, so the last iteration always returns or throws
+        return null;
     }
 
     /**
@@ -1138,19 +1051,19 @@ public final class S3Client implements AutoCloseable {
     // Retry infrastructure
     // -------------------------------------------------------------------------
 
-    private void sleepBeforeRetry(final int attempt, final long deadlineNanos) throws InterruptedException {
+    private void sleepBeforeRetry(final int attempt, final long deadlineNanos) {
         final long remainingNanos = deadlineNanos - System.nanoTime();
         // Cap shift at 62 to keep the left-shift result positive: shifting a long by 63
         // flips the sign bit; shifting by 64+ wraps around (JVM masks shift amount to 6 bits).
         final int shift = Math.min(attempt - 1, 62);
         // Full-jitter exponential back-off: pick a random delay in [0, min(maxDelay, base * 2^attempt)].
         // The min guards against the exponential growing past the configured ceiling.
-        final long cap = Math.min(retryPolicy.maxDelayMs(), retryPolicy.baseDelayMs() << shift);
-        final long max = cap <= 0 ? 0 : ThreadLocalRandom.current().nextLong(0, cap + 1);
+        final long capNanos = Math.min(retryPolicy.maxDelayMs(), retryPolicy.baseDelayMs() << shift) * 1_000_000L;
+        final long maxNanos = capNanos <= 0 ? 0 : ThreadLocalRandom.current().nextLong(0, capNanos + 1);
         // Never sleep longer than the time remaining before the total-timeout deadline.
-        final long sleepMs = Math.clamp(remainingNanos / 1_000_000L, 0L, max);
-        if (sleepMs > 0) {
-            Thread.sleep(sleepMs);
+        final long sleepNanos = Math.clamp(remainingNanos, 0L, maxNanos);
+        if (sleepNanos > 0) {
+            LockSupport.parkNanos(sleepNanos);
         }
     }
 
