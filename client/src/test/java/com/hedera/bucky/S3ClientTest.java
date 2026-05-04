@@ -1087,6 +1087,52 @@ public class S3ClientTest {
     }
 
     /**
+     * Verifies that {@link S3Client#uploadFile} succeeds when the object key
+     * contains characters that require percent-encoding (spaces and {@code +}).
+     *
+     * <p>Before the fix, {@code createMultipartUpload}, {@code multipartUploadPart},
+     * and {@code completeMultipartUpload} concatenated the raw key into the URL,
+     * producing a malformed URL and an incorrect SigV4 signature.
+     */
+    @Test
+    @DisplayName("uploadFile() succeeds with an object key containing spaces and special characters")
+    void testMultipartUploadWithSpecialCharacterKey() throws Exception {
+        final String key = "my folder/file+name.txt";
+        final String content = "content uploaded via multipart with a special-character key";
+        final byte[] contentBytes = content.getBytes(StandardCharsets.UTF_8);
+        try (final S3Client s3Client = client()) {
+            s3Client.uploadFile(key, "STANDARD", List.of(contentBytes).iterator(), "text/plain");
+        }
+        // Verify the object was stored under the correct (unencoded) key via MinIO
+        final byte[] actual = minioClient
+                .getObject(
+                        GetObjectArgs.builder().bucket(BUCKET_NAME).object(key).build())
+                .readAllBytes();
+        assertThat(new String(actual, StandardCharsets.UTF_8)).isEqualTo(content);
+    }
+
+    /**
+     * Verifies that {@link S3Client#abortMultipartUpload} succeeds when the
+     * object key contains characters that require percent-encoding.
+     *
+     * <p>Before the fix, the raw key in the DELETE URL caused a malformed
+     * request, leaving the upload ID dangling.
+     */
+    @Test
+    @DisplayName("abortMultipartUpload() succeeds with an object key containing spaces and special characters")
+    void testAbortMultipartUploadWithSpecialCharacterKey() throws Exception {
+        final String key = "abort folder/file+special.txt";
+        try (final S3Client s3Client = client()) {
+            final String uploadId = s3Client.createMultipartUpload(key, "STANDARD", "text/plain");
+            // Confirm the upload was registered
+            assertThat(s3Client.listMultipartUploads()).containsKey(key);
+            // Abort and confirm removal
+            s3Client.abortMultipartUpload(key, uploadId);
+            assertThat(s3Client.listMultipartUploads()).doesNotContainKey(key);
+        }
+    }
+
+    /**
      * This method will create a new instance of the {@link S3Client} to test.
      */
     private S3Client client() throws S3ClientInitializationException {
