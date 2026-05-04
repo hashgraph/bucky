@@ -125,19 +125,6 @@ jobs:
           commit_user_email: ${{ steps.gpg_importer.outputs.email }}
           tagging_message: ${{ env.RELEASE_TAG }}
 
-      - name: Create Github Release
-        uses: step-security/release-action@03a57407052f15d1537fd5469a6fbbc536aba326 # v1.20.0
-        with:
-          allowUpdates: true
-          commit: ${{ env.RELEASE_BRANCH }}
-          draft: true
-          generateReleaseNotes: false
-          name: ${{ env.RELEASE_TAG }}
-          omitBody: ${{ steps.milestone.outputs.milestone_id == '' }}
-          prerelease: ${{ steps.version_parser.outputs.prerelease != '' }}
-          tag: ${{ env.RELEASE_TAG }}
-          token: ${{ secrets.GH_ACCESS_TOKEN }}
-
   create_pr:
     timeout-minutes: 10
     name: Create PR
