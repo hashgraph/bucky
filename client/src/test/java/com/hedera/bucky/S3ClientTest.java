@@ -1087,6 +1087,37 @@ public class S3ClientTest {
     }
 
     /**
+     * Verifies that {@link S3Client#listObjects} correctly filters by a prefix
+     * that contains characters requiring percent-encoding (spaces).
+     *
+     * <p>Before the fix, the raw prefix was concatenated into the URL query string.
+     * A space in the prefix produced a literal space inside the URL, causing
+     * {@code new URI(url)} to throw {@code URISyntaxException} (wrapped as
+     * {@code UncheckedIOException}) before any request was even sent.
+     */
+    @Test
+    @DisplayName("listObjects() returns correct results when the prefix contains spaces")
+    void testListObjectsWithSpecialCharacterPrefix() throws Exception {
+        final String prefix = "my prefix/";
+        final List<String> expected = List.of(prefix + "file1.txt", prefix + "file2.txt");
+        final String unrelatedKey = "other-prefix/file.txt";
+        final String content = "prefix encoding test";
+        // Upload objects that should match and one that should not
+        for (final String key : expected) {
+            minioClient.putObject(PutObjectArgs.builder().bucket(BUCKET_NAME).object(key).stream(
+                            new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8)), content.length(), -1)
+                    .build());
+        }
+        minioClient.putObject(PutObjectArgs.builder().bucket(BUCKET_NAME).object(unrelatedKey).stream(
+                        new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8)), content.length(), -1)
+                .build());
+        try (final S3Client s3Client = client()) {
+            final List<String> actual = s3Client.listObjects(prefix, 100);
+            assertThat(actual).containsExactlyInAnyOrderElementsOf(expected).doesNotContain(unrelatedKey);
+        }
+    }
+
+    /**
      * This method will create a new instance of the {@link S3Client} to test.
      */
     private S3Client client() throws S3ClientInitializationException {

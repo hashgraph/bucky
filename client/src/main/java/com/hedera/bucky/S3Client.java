@@ -169,7 +169,8 @@ public final class S3Client implements AutoCloseable {
         Objects.requireNonNull(prefix);
         Preconditions.requireInRange(maxResults, LIST_OBJECTS_MIN, LIST_OBJECTS_MAX);
         // build a canonical query string with the prefix and max results
-        final String canonicalQueryString = "list-type=2&prefix=" + prefix + "&max-keys=" + maxResults;
+        final String canonicalQueryString =
+                "list-type=2&prefix=" + urlEncode(prefix, false) + "&max-keys=" + maxResults;
         // build the URL for the request
         final String url = endpoint + bucketName + "/?" + canonicalQueryString;
         // make the request to S3
