@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.hedera.bucky;
 
+import static java.lang.System.Logger.Level.DEBUG;
+
 import com.hedera.bucky.utils.Preconditions;
 import com.hedera.bucky.utils.StringUtilities;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import edu.umd.cs.findbugs.annotations.Nullable;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
@@ -36,18 +39,23 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
+import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.locks.LockSupport;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import javax.xml.XMLConstants;
 import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.parsers.ParserConfigurationException;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.NodeList;
+import org.xml.sax.SAXException;
 
 /**
  * Simple standalone S3 client for uploading, downloading and listing objects from S3.
@@ -95,6 +103,16 @@ public final class S3Client implements AutoCloseable {
     /** The DELETE HTTP Method canonical name **/
     private static final String DELETE = "DELETE";
 
+    /** Logger for retry warnings. */
+    private static final System.Logger LOGGER = System.getLogger(S3Client.class.getName());
+
+    /** HTTP status codes that indicate a transient failure worth retrying. */
+    private static final Set<Integer> RETRIABLE_STATUS_CODES = Set.of(408, 409, 429, 500, 502, 503, 504);
+
+    /** S3 error codes inside a 400 response body that indicate a retriable condition. */
+    private static final Set<String> RETRIABLE_400_ERROR_CODES =
+            Set.of("RequestTimeTooSkewed", "ExpiredToken", "BadDigest", "RequestTimeout");
+
     /** The S3 region name **/
     private final String regionName;
     /** The S3 endpoint URL **/
@@ -109,9 +127,11 @@ public final class S3Client implements AutoCloseable {
     private final HttpClient httpClient;
     /** The document builder factory used for response body parsing **/
     private final DocumentBuilderFactory documentBuilderFactory;
+    /** The retry policy controlling back-off behaviour **/
+    private final RetryPolicy retryPolicy;
 
     /**
-     * Constructor for S3Client.
+     * Constructor for S3Client using the default retry policy ({@link RetryPolicy#DEFAULT}).
      *
      * @param regionName The S3 region name (e.g. "us-east-1").
      * @param endpoint The S3 endpoint URL (e.g. "https://s3.amazonaws.com/").
@@ -128,12 +148,36 @@ public final class S3Client implements AutoCloseable {
             @NonNull final String accessKey,
             @NonNull final String secretKey)
             throws S3ClientInitializationException {
+        this(regionName, endpoint, bucketName, accessKey, secretKey, RetryPolicy.DEFAULT);
+    }
+
+    /**
+     * Constructor for S3Client with a custom retry policy.
+     *
+     * @param regionName The S3 region name (e.g. "us-east-1").
+     * @param endpoint The S3 endpoint URL (e.g. "https://s3.amazonaws.com/").
+     * @param bucketName The name of the S3 bucket.
+     * @param accessKey The S3 access key.
+     * @param secretKey The S3 secret key.
+     * @param retryPolicy The retry policy to use for transient failures. Cannot be null.
+     * @throws S3ClientInitializationException if an error occurs during
+     * client initialization or preconditions are not met.
+     */
+    public S3Client(
+            @NonNull final String regionName,
+            @NonNull final String endpoint,
+            @NonNull final String bucketName,
+            @NonNull final String accessKey,
+            @NonNull final String secretKey,
+            @NonNull final RetryPolicy retryPolicy)
+            throws S3ClientInitializationException {
         try {
             this.regionName = Preconditions.requireNotBlank(regionName);
             this.endpoint = Preconditions.requireNotBlank(endpoint).endsWith("/") ? endpoint : endpoint + "/";
             this.bucketName = Preconditions.requireNotBlank(bucketName);
             this.accessKey = Preconditions.requireNotBlank(accessKey);
             this.secretKey = Preconditions.requireNotBlank(secretKey);
+            this.retryPolicy = Objects.requireNonNull(retryPolicy, "retryPolicy must not be null");
             this.httpClient = HttpClient.newBuilder()
                     .version(HttpClient.Version.HTTP_1_1)
                     .connectTimeout(Duration.ofSeconds(30))
@@ -168,28 +212,7 @@ public final class S3Client implements AutoCloseable {
             throws S3ResponseException, IOException {
         Objects.requireNonNull(prefix);
         Preconditions.requireInRange(maxResults, LIST_OBJECTS_MIN, LIST_OBJECTS_MAX);
-        // build a canonical query string with the prefix and max results
-        final String canonicalQueryString = "list-type=2&prefix=" + prefix + "&max-keys=" + maxResults;
-        // build the URL for the request
-        final String url = endpoint + bucketName + "/?" + canonicalQueryString;
-        // make the request to S3
-        final HttpResponse<InputStream> response =
-                request(url, GET, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
-        // get status code
-        final int responseStatusCode = response.statusCode();
-        // parse the response body as XML, we always expect a body here generally
-        try (final InputStream in = response.body()) { // ensure body stream is always closed
-            if (responseStatusCode != 200) {
-                final String formattedPrefix = StringUtilities.isBlank(prefix) ? "BLANK_PREFIX" : prefix;
-                final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
-                final HttpHeaders responseHeaders = response.headers();
-                final String message = "Unsuccessful listing of objects: prefix=%s, maxResults=%s"
-                        .formatted(formattedPrefix, maxResults);
-                throw new S3ResponseException(responseStatusCode, responseBody, responseHeaders, message);
-            } else {
-                return extractChildText(parseDocument(in).getElementsByTagName("Contents"), "Key");
-            }
-        }
+        return withRetry(new ListObjectsOperation(this, prefix, maxResults));
     }
 
     /**
@@ -220,78 +243,7 @@ public final class S3Client implements AutoCloseable {
             throws S3ResponseException, IOException {
         Objects.requireNonNull(prefix);
         Preconditions.requireInRange(maxResults, LIST_OBJECTS_MIN, LIST_OBJECTS_MAX);
-        final String url = endpoint + bucketName + "/?"
-                + buildListPageQueryString(prefix, maxResults, delimiter, continuationToken);
-        final HttpResponse<InputStream> response =
-                request(url, GET, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
-        final int responseStatusCode = response.statusCode();
-        try (final InputStream in = response.body()) {
-            if (responseStatusCode != 200) {
-                final String formattedPrefix = StringUtilities.isBlank(prefix) ? "BLANK_PREFIX" : prefix;
-                final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
-                final HttpHeaders responseHeaders = response.headers();
-                final String message = "Unsuccessful listing of objects: prefix=%s, maxResults=%s"
-                        .formatted(formattedPrefix, maxResults);
-                throw new S3ResponseException(responseStatusCode, responseBody, responseHeaders, message);
-            } else {
-                final Document document = parseDocument(in);
-                final String outerTag = delimiter != null ? "CommonPrefixes" : "Contents";
-                final String innerTag = delimiter != null ? "Prefix" : "Key";
-                final List<String> results = extractChildText(document.getElementsByTagName(outerTag), innerTag);
-                final NodeList tokenNodes = document.getElementsByTagName("NextContinuationToken");
-                final String nextToken =
-                        tokenNodes.getLength() > 0 ? tokenNodes.item(0).getTextContent() : null;
-                return new ListPage(results, nextToken);
-            }
-        }
-    }
-
-    /**
-     * Builds the canonical query string for a list-objects-v2 request.
-     *
-     * @param prefix            prefix filter
-     * @param maxResults        maximum keys to return
-     * @param delimiter         grouping delimiter, or {@code null} for a flat listing
-     * @param continuationToken pagination token from a previous page, or {@code null}
-     * @return the assembled query string (not URL-encoded as a whole; individual values are encoded)
-     */
-    private static String buildListPageQueryString(
-            final String prefix,
-            final int maxResults,
-            @Nullable final String delimiter,
-            @Nullable final String continuationToken) {
-        final StringBuilder queryString = new StringBuilder("list-type=2&max-keys=")
-                .append(maxResults)
-                .append("&prefix=")
-                .append(prefix);
-        if (delimiter != null) {
-            queryString.append("&delimiter=").append(URLEncoder.encode(delimiter, StandardCharsets.UTF_8));
-        }
-        if (continuationToken != null) {
-            queryString
-                    .append("&continuation-token=")
-                    .append(URLEncoder.encode(continuationToken, StandardCharsets.UTF_8));
-        }
-        return queryString.toString();
-    }
-
-    /**
-     * Extracts the text content of the first {@code childTag} element found inside each element of
-     * {@code parentNodes}, skipping any parent that does not contain the child tag.
-     *
-     * @param parentNodes the list of parent elements to iterate over
-     * @param childTag    the tag name of the child element whose text content is wanted
-     * @return a mutable list of text values, in document order
-     */
-    private List<String> extractChildText(final NodeList parentNodes, final String childTag) {
-        final List<String> result = new ArrayList<>();
-        for (int i = 0; i < parentNodes.getLength(); i++) {
-            final NodeList children = ((Element) parentNodes.item(i)).getElementsByTagName(childTag);
-            if (children.getLength() > 0) {
-                result.add(children.item(0).getTextContent());
-            }
-        }
-        return result;
+        return withRetry(new ListObjectsPageOperation(this, prefix, continuationToken, delimiter, maxResults));
     }
 
     /**
@@ -309,33 +261,8 @@ public final class S3Client implements AutoCloseable {
         Preconditions.requireNotBlank(objectKey);
         Preconditions.requireNotBlank(storageClass);
         Preconditions.requireNotBlank(content);
-        // get content data
         final byte[] contentData = content.getBytes(StandardCharsets.UTF_8);
-        // initialize headers
-        final Map<String, String> headers = new HashMap<>();
-        headers.put("content-length", Integer.toString(contentData.length));
-        headers.put("content-type", "text/plain");
-        headers.put("x-amz-storage-class", storageClass);
-        headers.put("x-amz-content-sha256", base64(sha256(contentData)));
-        // build the URL for the request
-        final String url = endpoint + bucketName + "/" + urlEncode(objectKey, true);
-        // make the request to S3
-        final HttpResponse<InputStream> response =
-                request(url, PUT, headers, contentData, BodyHandlers.ofInputStream());
-        // get anc check status code
-        final int responseStatusCode = response.statusCode();
-        try (final InputStream in = response.body()) { // ensure body stream is always closed
-            if (responseStatusCode != 200) {
-                final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
-                final HttpHeaders responseHeaders = response.headers();
-                final String message = "Failed to upload text file: key=%s".formatted(objectKey);
-                throw new S3ResponseException(
-                        responseStatusCode,
-                        responseBody, // we expect a body here if the upload fails
-                        responseHeaders,
-                        message);
-            }
-        }
+        withRetry(new UploadTextFileOperation(this, objectKey, storageClass, contentData));
     }
 
     /**
@@ -348,26 +275,7 @@ public final class S3Client implements AutoCloseable {
      */
     public String downloadTextFile(@NonNull final String key) throws S3ResponseException, IOException {
         Preconditions.requireNotBlank(key);
-        // build the URL for the request
-        final String url = endpoint + bucketName + "/" + urlEncode(key, true);
-        // make the request
-        final HttpResponse<InputStream> response =
-                request(url, GET, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
-        // check status code and return value
-        final int responseStatusCode = response.statusCode();
-        try (final InputStream in = response.body()) { // ensure body stream is always closed
-            if (responseStatusCode == 404) {
-                // if not found, return null
-                return null;
-            } else if (responseStatusCode != 200) {
-                final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
-                final HttpHeaders responseHeaders = response.headers();
-                final String message = "Failed to download text file: key=%s".formatted(key);
-                throw new S3ResponseException(responseStatusCode, responseBody, responseHeaders, message);
-            } else {
-                return new String(in.readAllBytes(), StandardCharsets.UTF_8);
-            }
-        }
+        return withRetry(new DownloadTextFileOperation(this, key));
     }
 
     /**
@@ -442,41 +350,7 @@ public final class S3Client implements AutoCloseable {
      */
     @NonNull
     public Map<String, List<String>> listMultipartUploads() throws S3ResponseException, IOException {
-        // build the URL for the request
-        final String canonicalQueryString = "uploads=";
-        // build the request URL
-        final String url = endpoint + bucketName + "/" + "?" + canonicalQueryString;
-        // make the request
-        final HttpResponse<InputStream> response =
-                request(url, GET, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
-        // check status code
-        final int responseStatusCode = response.statusCode();
-        try (final InputStream in = response.body()) { // ensure body stream is always closed
-            if (responseStatusCode != 200) {
-                final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
-                final HttpHeaders responseHeaders = response.headers();
-                final String message = "Failed to list multipart uploads";
-                throw new S3ResponseException(responseStatusCode, responseBody, responseHeaders, message);
-            } else {
-                // build a map of upload IDs
-                final Map<String, List<String>> uploadIds = new TreeMap<>();
-                final Document bodyAsDocument = parseDocument(in);
-                final NodeList uploads = bodyAsDocument.getElementsByTagName("Upload");
-                final int length = uploads.getLength();
-                for (int i = 0; i < length; i++) {
-                    final Element uploadElement = (Element) uploads.item(i);
-                    final String key =
-                            uploadElement.getElementsByTagName("Key").item(0).getTextContent();
-                    final String uploadId = uploadElement
-                            .getElementsByTagName("UploadId")
-                            .item(0)
-                            .getTextContent();
-                    // Add the UploadId to the map under the corresponding Key
-                    uploadIds.computeIfAbsent(key, k -> new ArrayList<>()).add(uploadId);
-                }
-                return Collections.unmodifiableMap(uploadIds);
-            }
-        }
+        return withRetry(new ListMultipartUploadsOperation(this));
     }
 
     /**
@@ -491,23 +365,7 @@ public final class S3Client implements AutoCloseable {
             throws S3ResponseException, IOException {
         Preconditions.requireNotBlank(key);
         Preconditions.requireNotBlank(uploadId);
-        // build the canonical query string
-        final String canonicalQueryString = "uploadId=" + uploadId;
-        // build the request URL
-        final String url = endpoint + bucketName + "/" + key + "?" + canonicalQueryString;
-        // make the request
-        final HttpResponse<InputStream> response =
-                request(url, DELETE, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
-        // check status code
-        final int responseStatusCode = response.statusCode();
-        try (final InputStream in = response.body()) { // ensure body stream is always closed
-            if (responseStatusCode != 204) {
-                final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
-                final HttpHeaders responseHeaders = response.headers();
-                final String message = "Failed to abort multipart upload: key=%s, uploadId=%s".formatted(key, uploadId);
-                throw new S3ResponseException(responseStatusCode, responseBody, responseHeaders, message);
-            }
-        }
+        withRetry(new AbortMultipartUploadOperation(this, key, uploadId));
     }
 
     /**
@@ -519,21 +377,7 @@ public final class S3Client implements AutoCloseable {
      */
     public void deleteObject(@NonNull final String key) throws S3ResponseException, IOException {
         Preconditions.requireNotBlank(key);
-        final String url = endpoint + bucketName + "/" + key;
-        final HttpResponse<InputStream> response =
-                request(url, DELETE, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
-        final int responseStatusCode = response.statusCode();
-        try (final InputStream in = response.body()) {
-            if (responseStatusCode != 204) {
-                final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
-                final HttpHeaders responseHeaders = response.headers();
-                throw new S3ResponseException(
-                        responseStatusCode,
-                        responseBody,
-                        responseHeaders,
-                        "Failed to remove object: key=%s".formatted(key));
-            }
-        }
+        withRetry(new DeleteObjectOperation(this, key));
     }
 
     /**
@@ -549,31 +393,7 @@ public final class S3Client implements AutoCloseable {
     public String createMultipartUpload(
             @NonNull final String key, @NonNull final String storageClass, @NonNull final String contentType)
             throws S3ResponseException, IOException {
-        // build the canonical query string
-        final String canonicalQueryString = "uploads=";
-        // build the request headers
-        final Map<String, String> headers = new HashMap<>();
-        headers.put("content-type", contentType);
-        headers.put("x-amz-storage-class", storageClass);
-        // build the request URL
-        final String url = endpoint + bucketName + "/" + key + "?" + canonicalQueryString;
-        // make the request
-        final HttpResponse<InputStream> response = request(url, POST, headers, null, BodyHandlers.ofInputStream());
-        // parse the response body as XML and check status
-        final int responseStatusCode = response.statusCode();
-        try (final InputStream in = response.body()) { // ensure body stream is always closed
-            if (responseStatusCode != 200) {
-                final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
-                final HttpHeaders responseHeaders = response.headers();
-                final String message = "Failed to create multipart upload: key=%s".formatted(key);
-                throw new S3ResponseException(responseStatusCode, responseBody, responseHeaders, message);
-            } else {
-                return parseDocument(in)
-                        .getElementsByTagName("UploadId")
-                        .item(0)
-                        .getTextContent();
-            }
-        }
+        return withRetry(new CreateMultipartUploadOperation(this, key, storageClass, contentType));
     }
 
     /**
@@ -593,31 +413,7 @@ public final class S3Client implements AutoCloseable {
             final int partNumber,
             @NonNull final byte[] partData)
             throws S3ResponseException, IOException {
-        // build the canonical query string
-        final String canonicalQueryString = "uploadId=" + uploadId + "&partNumber=" + partNumber;
-        // build request headers
-        final Map<String, String> headers = new HashMap<>();
-        headers.put("content-length", Integer.toString(partData.length));
-        headers.put("content-type", "application/octet-stream");
-        headers.put("x-amz-content-sha256", base64(sha256(partData)));
-        // build the URL for the request
-        final String url = endpoint + bucketName + "/" + key + "?" + canonicalQueryString;
-        // make the request
-        final HttpResponse<InputStream> response = request(url, PUT, headers, partData, BodyHandlers.ofInputStream());
-        // check status code
-        final int responseStatusCode = response.statusCode();
-        try (final InputStream in = response.body()) { // ensure body stream is always closed
-            if (responseStatusCode != 200) {
-                // throw if request not successful
-                final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
-                final HttpHeaders responseHeaders = response.headers();
-                final String message = "Failed to upload multipart part: key=%s, uploadId=%s, partNumber=%d"
-                        .formatted(key, uploadId, partNumber);
-                throw new S3ResponseException(responseStatusCode, responseBody, responseHeaders, message);
-            } else {
-                return response.headers().firstValue("ETag").orElse(null);
-            }
-        }
+        return withRetry(new MultipartUploadPartOperation(this, key, uploadId, partNumber, partData));
     }
 
     /**
@@ -632,12 +428,6 @@ public final class S3Client implements AutoCloseable {
     public void completeMultipartUpload(
             @NonNull final String key, @NonNull final String uploadId, @NonNull final List<String> eTags)
             throws S3ResponseException, IOException {
-        // build canonical query string
-        final String canonicalQueryString = "uploadId=" + uploadId;
-        // build the headers for the request
-        final Map<String, String> headers = new HashMap<>();
-        headers.put("content-type", "application/xml");
-        // build the body of the request
         final StringBuilder sb = new StringBuilder();
         sb.append("<CompleteMultipartUpload>");
         for (int i = 0; i < eTags.size(); i++) {
@@ -649,23 +439,7 @@ public final class S3Client implements AutoCloseable {
         }
         sb.append("</CompleteMultipartUpload>");
         final byte[] requestBody = sb.toString().getBytes(StandardCharsets.UTF_8);
-        // build the request URL
-        final String url = endpoint + bucketName + "/" + key + "?" + canonicalQueryString;
-        // make the request
-        final HttpResponse<InputStream> response =
-                request(url, POST, headers, requestBody, BodyHandlers.ofInputStream());
-        // check status code
-        final int responseStatusCode = response.statusCode();
-        try (final InputStream in = response.body()) { // ensure body stream is always closed
-            if (responseStatusCode != 200) {
-                // throw if request not successful
-                final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
-                final HttpHeaders responseHeaders = response.headers();
-                final String message =
-                        "Failed to complete multipart upload: key=%s, uploadId=%s".formatted(key, uploadId);
-                throw new S3ResponseException(responseStatusCode, responseBody, responseHeaders, message);
-            }
-        }
+        withRetry(new CompleteMultipartUploadOperation(this, key, uploadId, requestBody));
     }
 
     /**
@@ -682,31 +456,7 @@ public final class S3Client implements AutoCloseable {
             throws S3ResponseException, IOException {
         Preconditions.requireNotBlank(key);
         Preconditions.requireNotBlank(uploadId);
-        final String canonicalQueryString = "max-parts=1000&uploadId=" + uploadId;
-        final String url = endpoint + bucketName + "/" + urlEncode(key, true) + "?" + canonicalQueryString;
-        final HttpResponse<InputStream> response =
-                request(url, GET, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
-        final int responseStatusCode = response.statusCode();
-        try (final InputStream in = response.body()) {
-            if (responseStatusCode != 200) {
-                final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
-                final HttpHeaders responseHeaders = response.headers();
-                final String message = "Failed to list parts: key=%s, uploadId=%s".formatted(key, uploadId);
-                throw new S3ResponseException(responseStatusCode, responseBody, responseHeaders, message);
-            }
-            final SortedMap<Integer, PartInfo> parts = new ConcurrentSkipListMap<>();
-            final NodeList partNodes = parseDocument(in).getElementsByTagName("Part");
-            for (int i = 0; i < partNodes.getLength(); i++) {
-                final Element part = (Element) partNodes.item(i);
-                final int partNumber = Integer.parseInt(
-                        part.getElementsByTagName("PartNumber").item(0).getTextContent());
-                final long size =
-                        Long.parseLong(part.getElementsByTagName("Size").item(0).getTextContent());
-                final String etag = part.getElementsByTagName("ETag").item(0).getTextContent();
-                parts.put(partNumber, new PartInfo(partNumber, size, etag));
-            }
-            return parts.values().stream().toList();
-        }
+        return withRetry(new ListPartsOperation(this, key, uploadId));
     }
 
     /**
@@ -735,23 +485,8 @@ public final class S3Client implements AutoCloseable {
         Preconditions.requireNotBlank(sourceKey);
         Preconditions.requireNotBlank(destKey);
         Preconditions.requireNotBlank(uploadId);
-        final String canonicalQueryString = "partNumber=" + partNumber + "&uploadId=" + uploadId;
-        final Map<String, String> headers = new HashMap<>();
-        headers.put("x-amz-copy-source", "/" + bucketName + "/" + urlEncode(sourceKey, true));
-        headers.put("x-amz-copy-source-range", "bytes=" + startByte + "-" + endByte);
-        final String url = endpoint + bucketName + "/" + urlEncode(destKey, true) + "?" + canonicalQueryString;
-        final HttpResponse<InputStream> response = request(url, PUT, headers, null, BodyHandlers.ofInputStream());
-        final int responseStatusCode = response.statusCode();
-        try (final InputStream in = response.body()) {
-            if (responseStatusCode != 200) {
-                final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
-                final HttpHeaders responseHeaders = response.headers();
-                final String message = "Failed to copy part: sourceKey=%s, destKey=%s, uploadId=%s, partNumber=%d"
-                        .formatted(sourceKey, destKey, uploadId, partNumber);
-                throw new S3ResponseException(responseStatusCode, responseBody, responseHeaders, message);
-            }
-            return parseDocument(in).getElementsByTagName("ETag").item(0).getTextContent();
-        }
+        return withRetry(
+                new UploadPartCopyOperation(this, sourceKey, startByte, endByte, destKey, uploadId, partNumber));
     }
 
     /**
@@ -768,18 +503,65 @@ public final class S3Client implements AutoCloseable {
     public byte[] downloadObjectRange(@NonNull final String key, final long startByte, final long endByte)
             throws S3ResponseException, IOException {
         Preconditions.requireNotBlank(key);
-        final Map<String, String> headers = new HashMap<>();
-        headers.put("Range", "bytes=" + startByte + "-" + endByte);
-        final String url = endpoint + bucketName + "/" + urlEncode(key, true);
-        final HttpResponse<byte[]> response = request(url, GET, headers, null, BodyHandlers.ofByteArray());
-        final int responseStatusCode = response.statusCode();
-        if (responseStatusCode == 206 || responseStatusCode == 200) {
-            return response.body();
-        }
-        final String message =
-                "Failed to download object range: key=%s, range=%d-%d".formatted(key, startByte, endByte);
-        throw new S3ResponseException(responseStatusCode, null, response.headers(), message);
+        return withRetry(new DownloadObjectRangeOperation(this, key, startByte, endByte));
     }
+
+    /**
+     * Builds the canonical query string for a list-objects-v2 request.
+     *
+     * @param prefix            prefix filter
+     * @param maxResults        maximum keys to return
+     * @param delimiter         grouping delimiter, or {@code null} for a flat listing
+     * @param continuationToken pagination token from a previous page, or {@code null}
+     * @return the assembled query string (not URL-encoded as a whole; individual values are encoded)
+     */
+    private static String buildListPageQueryString(
+            final String prefix,
+            final int maxResults,
+            @Nullable final String delimiter,
+            @Nullable final String continuationToken) {
+        final StringBuilder queryString = new StringBuilder("list-type=2&max-keys=")
+                .append(maxResults)
+                .append("&prefix=")
+                .append(prefix);
+        if (delimiter != null) {
+            queryString.append("&delimiter=").append(URLEncoder.encode(delimiter, StandardCharsets.UTF_8));
+        }
+        if (continuationToken != null) {
+            queryString
+                    .append("&continuation-token=")
+                    .append(URLEncoder.encode(continuationToken, StandardCharsets.UTF_8));
+        }
+        return queryString.toString();
+    }
+
+    /**
+     * Extracts the text content of the first {@code childTag} element found inside each element of
+     * {@code parentNodes}, skipping any parent that does not contain the child tag.
+     *
+     * @param parentNodes the list of parent elements to iterate over
+     * @param childTag    the tag name of the child element whose text content is wanted
+     * @return a mutable list of text values, in document order
+     */
+    private List<String> extractChildText(final NodeList parentNodes, final String childTag) {
+        final List<String> result = new ArrayList<>();
+        for (int i = 0; i < parentNodes.getLength(); i++) {
+            final NodeList children = ((Element) parentNodes.item(i)).getElementsByTagName(childTag);
+            if (children.getLength() > 0) {
+                result.add(children.item(0).getTextContent());
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Carries one page of S3 list results plus an optional continuation token for the next page.
+     *
+     * @param keys                the object keys (or common prefixes) returned in this page
+     * @param continuationToken   token to pass to the next call to retrieve the following page;
+     *                            {@code null} when this is the last page
+     */
+    public record ListPage(List<String> keys, @Nullable String continuationToken) {}
 
     /**
      * Carries the metadata of one part in an in-progress multipart upload.
@@ -790,14 +572,780 @@ public final class S3Client implements AutoCloseable {
      */
     public record PartInfo(int partNumber, long size, String etag) {}
 
+    // -------------------------------------------------------------------------
+    // Retry infrastructure
+    // -------------------------------------------------------------------------
+
+    private sealed interface Result<T> permits Result.Success, Result.NetworkFailure, Result.ResponseFailure {
+        record Success<T>(T value) implements Result<T> {}
+
+        record NetworkFailure<T>(IOException cause) implements Result<T> {}
+
+        record ResponseFailure<T>(int statusCode, byte[] body, HttpHeaders headers, String message)
+                implements Result<T> {}
+    }
+
+    @FunctionalInterface
+    private interface S3Operation<T> {
+        Result<T> execute();
+    }
+
+    @SuppressWarnings("unchecked")
+    private <T> T withRetry(final S3Operation<T> operation) throws S3ResponseException, IOException {
+        final long deadlineNanos = System.nanoTime() + retryPolicy.totalTimeoutMs() * 1_000_000L;
+        for (int attempt = 0; attempt < retryPolicy.maxAttempts(); attempt++) {
+            switch (operation.execute()) {
+                case Result.Success<?> s -> {
+                    return (T) s.value();
+                }
+                case Result.NetworkFailure<?> f -> {
+                    if (!canRetryNetworkError(f.cause(), attempt, deadlineNanos)) {
+                        throw f.cause();
+                    }
+                    sleepBeforeRetry(attempt, deadlineNanos);
+                    if (System.nanoTime() >= deadlineNanos) {
+                        throw f.cause();
+                    }
+                }
+                case Result.ResponseFailure<?> f -> {
+                    if (!canRetryResponseError(f.statusCode(), f.body(), f.headers(), attempt, deadlineNanos)) {
+                        throw new S3ResponseException(f.statusCode(), f.body(), f.headers(), f.message());
+                    }
+                    sleepBeforeRetry(attempt, deadlineNanos);
+                    if (System.nanoTime() >= deadlineNanos) {
+                        throw new S3ResponseException(f.statusCode(), f.body(), f.headers(), f.message());
+                    }
+                }
+            }
+        }
+        // unreachable — RetryPolicy validates maxAttempts >= 1, so the last iteration always returns or throws
+        return null;
+    }
+
+    private void sleepBeforeRetry(final int attempt, final long deadlineNanos) {
+        final long remainingNanos = deadlineNanos - System.nanoTime();
+        // Cap shift at 62 to keep the left-shift result positive: shifting a long by 63
+        // flips the sign bit; shifting by 64+ wraps around (JVM masks shift amount to 6 bits).
+        final int shift = Math.min(attempt - 1, 62);
+        // Full-jitter exponential back-off: pick a random delay in [0, min(maxDelay, base * 2^attempt)].
+        // The min guards against the exponential growing past the configured ceiling.
+        final long capNanos = Math.min(retryPolicy.maxDelayMs(), retryPolicy.baseDelayMs() << shift) * 1_000_000L;
+        final long maxNanos = capNanos <= 0 ? 0 : ThreadLocalRandom.current().nextLong(0, capNanos + 1);
+        // Never sleep longer than the time remaining before the total-timeout deadline.
+        final long sleepNanos = Math.clamp(remainingNanos, 0L, maxNanos);
+        if (sleepNanos > 0) {
+            LockSupport.parkNanos(sleepNanos);
+        }
+    }
+
     /**
-     * Carries one page of S3 list results plus an optional continuation token for the next page.
-     *
-     * @param keys                the object keys (or common prefixes) returned in this page
-     * @param continuationToken   token to pass to the next call to retrieve the following page;
-     *                            {@code null} when this is the last page
+     * Returns {@code true} if the network error is retriable and the loop should continue.
      */
-    public record ListPage(List<String> keys, @Nullable String continuationToken) {}
+    private boolean canRetryNetworkError(final IOException ex, final int attempt, final long deadlineNanos) {
+        final boolean canRetry = attempt + 1 < retryPolicy.maxAttempts()
+                && System.nanoTime() < deadlineNanos
+                && !Thread.currentThread().isInterrupted();
+        if (canRetry) {
+            LOGGER.log(
+                    DEBUG,
+                    "S3 network error on attempt {0}/{1}, will retry: {2}",
+                    attempt + 1,
+                    retryPolicy.maxAttempts(),
+                    ex.getMessage());
+        }
+        return canRetry;
+    }
+
+    /**
+     * Returns {@code true} if the response error is retriable and the loop should continue.
+     */
+    private boolean canRetryResponseError(
+            final int statusCode,
+            final byte[] body,
+            final HttpHeaders headers,
+            final int attempt,
+            final long deadlineNanos) {
+        final boolean canRetry = isRetriable(statusCode, body)
+                && attempt + 1 < retryPolicy.maxAttempts()
+                && System.nanoTime() < deadlineNanos;
+        if (canRetry) {
+            LOGGER.log(
+                    DEBUG,
+                    "S3 retriable HTTP {0} on attempt {1}/{2}, x-amz-request-id={3}, x-amz-id-2={4}",
+                    statusCode,
+                    attempt + 1,
+                    retryPolicy.maxAttempts(),
+                    firstHeader(headers, "x-amz-request-id"),
+                    firstHeader(headers, "x-amz-id-2"));
+        }
+        return canRetry;
+    }
+
+    /**
+     * Returns true when the given status code and body represent a condition worth retrying.
+     */
+    private boolean isRetriable(final int status, final byte[] body) {
+        return RETRIABLE_STATUS_CODES.contains(status) || (status == 400 && isRetriable400(body));
+    }
+
+    /**
+     * Parses the S3 XML error body to check whether the {@code <Code>} element names a retriable
+     * error condition. Returns {@code false} for non-XML bodies or missing {@code <Code>}.
+     */
+    private boolean isRetriable400(final byte[] body) {
+        boolean isRetriable = false;
+
+        if (body != null && body.length > 0) {
+            try {
+                final Document doc = documentBuilderFactory.newDocumentBuilder().parse(new ByteArrayInputStream(body));
+                final NodeList codes = doc.getElementsByTagName("Code");
+                if (codes.getLength() > 0) {
+                    isRetriable =
+                            RETRIABLE_400_ERROR_CODES.contains(codes.item(0).getTextContent());
+                }
+            } catch (final SAXException | ParserConfigurationException | IOException | RuntimeException ignored) {
+                // non-XML or missing <Code> — treat as non-retriable
+            }
+        }
+        return isRetriable;
+    }
+
+    /** Extracts the first value of {@code headerName} from {@code headers}, or {@code "n/a"}. */
+    private static String firstHeader(final HttpHeaders headers, final String headerName) {
+        return headers != null ? headers.firstValue(headerName).orElse("n/a") : "n/a";
+    }
+
+    // -------------------------------------------------------------------------
+    // Operation implementations
+    // -------------------------------------------------------------------------
+
+    private static final class ListObjectsOperation implements S3Operation<List<String>> {
+        private final S3Client client;
+        private final String prefix;
+        private final int maxResults;
+
+        ListObjectsOperation(final S3Client client, final String prefix, final int maxResults) {
+            this.client = client;
+            this.prefix = prefix;
+            this.maxResults = maxResults;
+        }
+
+        @Override
+        public Result<List<String>> execute() {
+            Result<List<String>> result;
+            try {
+                final String canonicalQueryString = "list-type=2&prefix=" + prefix + "&max-keys=" + maxResults;
+                final String url = client.endpoint + client.bucketName + "/?" + canonicalQueryString;
+                final HttpResponse<InputStream> response =
+                        client.request(url, GET, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
+                final int responseStatusCode = response.statusCode();
+                try (final InputStream in = response.body()) {
+                    if (responseStatusCode != 200) {
+                        final String formattedPrefix = StringUtilities.isBlank(prefix) ? "BLANK_PREFIX" : prefix;
+                        final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
+                        final HttpHeaders responseHeaders = response.headers();
+                        final String message = "Unsuccessful listing of objects: prefix=%s, maxResults=%s"
+                                .formatted(formattedPrefix, maxResults);
+                        result = new Result.ResponseFailure<>(
+                                responseStatusCode, responseBody, responseHeaders, message);
+                    } else {
+                        result = new Result.Success<>(client.extractChildText(
+                                client.parseDocument(in).getElementsByTagName("Contents"), "Key"));
+                    }
+                }
+            } catch (final UncheckedIOException e) {
+                result = new Result.NetworkFailure<>(e.getCause());
+            } catch (final IOException e) {
+                result = new Result.NetworkFailure<>(e);
+            }
+            return result;
+        }
+    }
+
+    private static final class ListObjectsPageOperation implements S3Operation<ListPage> {
+        private final S3Client client;
+        private final String prefix;
+        private final String continuationToken;
+        private final String delimiter;
+        private final int maxResults;
+
+        ListObjectsPageOperation(
+                final S3Client client,
+                final String prefix,
+                final String continuationToken,
+                final String delimiter,
+                final int maxResults) {
+            this.client = client;
+            this.prefix = prefix;
+            this.continuationToken = continuationToken;
+            this.delimiter = delimiter;
+            this.maxResults = maxResults;
+        }
+
+        @Override
+        public Result<ListPage> execute() {
+            Result<ListPage> result;
+            try {
+                final String url = client.endpoint + client.bucketName + "/?"
+                        + buildListPageQueryString(prefix, maxResults, delimiter, continuationToken);
+                final HttpResponse<InputStream> response =
+                        client.request(url, GET, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
+                final int responseStatusCode = response.statusCode();
+                try (final InputStream in = response.body()) {
+                    if (responseStatusCode != 200) {
+                        final String formattedPrefix = StringUtilities.isBlank(prefix) ? "BLANK_PREFIX" : prefix;
+                        final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
+                        final HttpHeaders responseHeaders = response.headers();
+                        final String message = "Unsuccessful listing of objects: prefix=%s, maxResults=%s"
+                                .formatted(formattedPrefix, maxResults);
+                        result = new Result.ResponseFailure<>(
+                                responseStatusCode, responseBody, responseHeaders, message);
+                    } else {
+                        final Document document = client.parseDocument(in);
+                        final String outerTag = delimiter != null ? "CommonPrefixes" : "Contents";
+                        final String innerTag = delimiter != null ? "Prefix" : "Key";
+                        final List<String> results =
+                                client.extractChildText(document.getElementsByTagName(outerTag), innerTag);
+                        final NodeList tokenNodes = document.getElementsByTagName("NextContinuationToken");
+                        final String nextToken =
+                                tokenNodes.getLength() > 0 ? tokenNodes.item(0).getTextContent() : null;
+                        result = new Result.Success<>(new ListPage(results, nextToken));
+                    }
+                }
+            } catch (final UncheckedIOException e) {
+                result = new Result.NetworkFailure<>(e.getCause());
+            } catch (final IOException e) {
+                result = new Result.NetworkFailure<>(e);
+            }
+            return result;
+        }
+    }
+
+    private static final class UploadTextFileOperation implements S3Operation<Void> {
+        private final S3Client client;
+        private final String objectKey;
+        private final String storageClass;
+        private final byte[] contentData;
+
+        UploadTextFileOperation(
+                final S3Client client, final String objectKey, final String storageClass, final byte[] contentData) {
+            this.client = client;
+            this.objectKey = objectKey;
+            this.storageClass = storageClass;
+            this.contentData = contentData;
+        }
+
+        @Override
+        public Result<Void> execute() {
+            Result<Void> result;
+            try {
+                final Map<String, String> headers = new HashMap<>();
+                headers.put("content-length", Integer.toString(contentData.length));
+                headers.put("content-type", "text/plain");
+                headers.put("x-amz-storage-class", storageClass);
+                headers.put("x-amz-content-sha256", base64(sha256(contentData)));
+                final String url = client.endpoint + client.bucketName + "/" + urlEncode(objectKey, true);
+                final HttpResponse<InputStream> response =
+                        client.request(url, PUT, headers, contentData, BodyHandlers.ofInputStream());
+                final int responseStatusCode = response.statusCode();
+                try (final InputStream in = response.body()) {
+                    if (responseStatusCode != 200) {
+                        final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
+                        final HttpHeaders responseHeaders = response.headers();
+                        final String message = "Failed to upload text file: key=%s".formatted(objectKey);
+                        result = new Result.ResponseFailure<>(
+                                responseStatusCode, responseBody, responseHeaders, message);
+                    } else {
+                        result = new Result.Success<>(null);
+                    }
+                }
+            } catch (final UncheckedIOException e) {
+                result = new Result.NetworkFailure<>(e.getCause());
+            } catch (final IOException e) {
+                result = new Result.NetworkFailure<>(e);
+            }
+            return result;
+        }
+    }
+
+    private static final class DownloadTextFileOperation implements S3Operation<String> {
+        private final S3Client client;
+        private final String key;
+
+        DownloadTextFileOperation(final S3Client client, final String key) {
+            this.client = client;
+            this.key = key;
+        }
+
+        @Override
+        public Result<String> execute() {
+            Result<String> result;
+            try {
+                final String url = client.endpoint + client.bucketName + "/" + urlEncode(key, true);
+                final HttpResponse<InputStream> response =
+                        client.request(url, GET, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
+                final int responseStatusCode = response.statusCode();
+                try (final InputStream in = response.body()) {
+                    if (responseStatusCode == 404) {
+                        result = new Result.Success<>(null);
+                    } else if (responseStatusCode != 200) {
+                        final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
+                        final HttpHeaders responseHeaders = response.headers();
+                        final String message = "Failed to download text file: key=%s".formatted(key);
+                        result = new Result.ResponseFailure<>(
+                                responseStatusCode, responseBody, responseHeaders, message);
+                    } else {
+                        result = new Result.Success<>(new String(in.readAllBytes(), StandardCharsets.UTF_8));
+                    }
+                }
+            } catch (final UncheckedIOException e) {
+                result = new Result.NetworkFailure<>(e.getCause());
+            } catch (final IOException e) {
+                result = new Result.NetworkFailure<>(e);
+            }
+            return result;
+        }
+    }
+
+    private static final class ListMultipartUploadsOperation implements S3Operation<Map<String, List<String>>> {
+        private final S3Client client;
+
+        ListMultipartUploadsOperation(final S3Client client) {
+            this.client = client;
+        }
+
+        @Override
+        public Result<Map<String, List<String>>> execute() {
+            Result<Map<String, List<String>>> result;
+            try {
+                final String url = client.endpoint + client.bucketName + "/" + "?" + "uploads=";
+                final HttpResponse<InputStream> response =
+                        client.request(url, GET, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
+                final int responseStatusCode = response.statusCode();
+                try (final InputStream in = response.body()) {
+                    if (responseStatusCode != 200) {
+                        final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
+                        final HttpHeaders responseHeaders = response.headers();
+                        result = new Result.ResponseFailure<>(
+                                responseStatusCode, responseBody, responseHeaders, "Failed to list multipart uploads");
+                    } else {
+                        final Map<String, List<String>> uploadIds = new TreeMap<>();
+                        final Document bodyAsDocument = client.parseDocument(in);
+                        final NodeList uploads = bodyAsDocument.getElementsByTagName("Upload");
+                        final int length = uploads.getLength();
+                        for (int i = 0; i < length; i++) {
+                            final Element uploadElement = (Element) uploads.item(i);
+                            final String key = uploadElement
+                                    .getElementsByTagName("Key")
+                                    .item(0)
+                                    .getTextContent();
+                            final String uploadId = uploadElement
+                                    .getElementsByTagName("UploadId")
+                                    .item(0)
+                                    .getTextContent();
+                            uploadIds
+                                    .computeIfAbsent(key, k -> new ArrayList<>())
+                                    .add(uploadId);
+                        }
+                        result = new Result.Success<>(Collections.unmodifiableMap(uploadIds));
+                    }
+                }
+            } catch (final UncheckedIOException e) {
+                result = new Result.NetworkFailure<>(e.getCause());
+            } catch (final IOException e) {
+                result = new Result.NetworkFailure<>(e);
+            }
+            return result;
+        }
+    }
+
+    private static final class AbortMultipartUploadOperation implements S3Operation<Void> {
+        private final S3Client client;
+        private final String key;
+        private final String uploadId;
+
+        AbortMultipartUploadOperation(final S3Client client, final String key, final String uploadId) {
+            this.client = client;
+            this.key = key;
+            this.uploadId = uploadId;
+        }
+
+        @Override
+        public Result<Void> execute() {
+            Result<Void> result;
+            try {
+                final String url = client.endpoint + client.bucketName + "/" + key + "?" + "uploadId=" + uploadId;
+                final HttpResponse<InputStream> response =
+                        client.request(url, DELETE, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
+                final int responseStatusCode = response.statusCode();
+                try (final InputStream in = response.body()) {
+                    if (responseStatusCode != 204) {
+                        final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
+                        final HttpHeaders responseHeaders = response.headers();
+                        final String message =
+                                "Failed to abort multipart upload: key=%s, uploadId=%s".formatted(key, uploadId);
+                        result = new Result.ResponseFailure<>(
+                                responseStatusCode, responseBody, responseHeaders, message);
+                    } else {
+                        result = new Result.Success<>(null);
+                    }
+                }
+            } catch (final UncheckedIOException e) {
+                result = new Result.NetworkFailure<>(e.getCause());
+            } catch (final IOException e) {
+                result = new Result.NetworkFailure<>(e);
+            }
+            return result;
+        }
+    }
+
+    private static final class DeleteObjectOperation implements S3Operation<Void> {
+        private final S3Client client;
+        private final String key;
+
+        DeleteObjectOperation(final S3Client client, final String key) {
+            this.client = client;
+            this.key = key;
+        }
+
+        @Override
+        public Result<Void> execute() {
+            Result<Void> result;
+            try {
+                final String url = client.endpoint + client.bucketName + "/" + key;
+                final HttpResponse<InputStream> response =
+                        client.request(url, DELETE, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
+                final int responseStatusCode = response.statusCode();
+                try (final InputStream in = response.body()) {
+                    if (responseStatusCode != 204) {
+                        final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
+                        final HttpHeaders responseHeaders = response.headers();
+                        result = new Result.ResponseFailure<>(
+                                responseStatusCode,
+                                responseBody,
+                                responseHeaders,
+                                "Failed to remove object: key=%s".formatted(key));
+                    } else {
+                        result = new Result.Success<>(null);
+                    }
+                }
+            } catch (final UncheckedIOException e) {
+                result = new Result.NetworkFailure<>(e.getCause());
+            } catch (final IOException e) {
+                result = new Result.NetworkFailure<>(e);
+            }
+            return result;
+        }
+    }
+
+    private static final class CreateMultipartUploadOperation implements S3Operation<String> {
+        private final S3Client client;
+        private final String key;
+        private final String storageClass;
+        private final String contentType;
+
+        CreateMultipartUploadOperation(
+                final S3Client client, final String key, final String storageClass, final String contentType) {
+            this.client = client;
+            this.key = key;
+            this.storageClass = storageClass;
+            this.contentType = contentType;
+        }
+
+        @Override
+        public Result<String> execute() {
+            Result<String> result;
+            try {
+                final Map<String, String> headers = new HashMap<>();
+                headers.put("content-type", contentType);
+                headers.put("x-amz-storage-class", storageClass);
+                final String url = client.endpoint + client.bucketName + "/" + key + "?" + "uploads=";
+                final HttpResponse<InputStream> response =
+                        client.request(url, POST, headers, null, BodyHandlers.ofInputStream());
+                final int responseStatusCode = response.statusCode();
+                try (final InputStream in = response.body()) {
+                    if (responseStatusCode != 200) {
+                        final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
+                        final HttpHeaders responseHeaders = response.headers();
+                        final String message = "Failed to create multipart upload: key=%s".formatted(key);
+                        result = new Result.ResponseFailure<>(
+                                responseStatusCode, responseBody, responseHeaders, message);
+                    } else {
+                        result = new Result.Success<>(client.parseDocument(in)
+                                .getElementsByTagName("UploadId")
+                                .item(0)
+                                .getTextContent());
+                    }
+                }
+            } catch (final UncheckedIOException e) {
+                result = new Result.NetworkFailure<>(e.getCause());
+            } catch (final IOException e) {
+                result = new Result.NetworkFailure<>(e);
+            }
+            return result;
+        }
+    }
+
+    private static final class MultipartUploadPartOperation implements S3Operation<String> {
+        private final S3Client client;
+        private final String key;
+        private final String uploadId;
+        private final int partNumber;
+        private final byte[] partData;
+
+        MultipartUploadPartOperation(
+                final S3Client client,
+                final String key,
+                final String uploadId,
+                final int partNumber,
+                final byte[] partData) {
+            this.client = client;
+            this.key = key;
+            this.uploadId = uploadId;
+            this.partNumber = partNumber;
+            this.partData = partData;
+        }
+
+        @Override
+        public Result<String> execute() {
+            Result<String> result;
+            try {
+                final String canonicalQueryString = "uploadId=" + uploadId + "&partNumber=" + partNumber;
+                final Map<String, String> headers = new HashMap<>();
+                headers.put("content-length", Integer.toString(partData.length));
+                headers.put("content-type", "application/octet-stream");
+                headers.put("x-amz-content-sha256", base64(sha256(partData)));
+                final String url = client.endpoint + client.bucketName + "/" + key + "?" + canonicalQueryString;
+                final HttpResponse<InputStream> response =
+                        client.request(url, PUT, headers, partData, BodyHandlers.ofInputStream());
+                final int responseStatusCode = response.statusCode();
+                try (final InputStream in = response.body()) {
+                    if (responseStatusCode != 200) {
+                        final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
+                        final HttpHeaders responseHeaders = response.headers();
+                        final String message = "Failed to upload multipart part: key=%s, uploadId=%s, partNumber=%d"
+                                .formatted(key, uploadId, partNumber);
+                        result = new Result.ResponseFailure<>(
+                                responseStatusCode, responseBody, responseHeaders, message);
+                    } else {
+                        result = new Result.Success<>(
+                                response.headers().firstValue("ETag").orElse(null));
+                    }
+                }
+            } catch (final UncheckedIOException e) {
+                result = new Result.NetworkFailure<>(e.getCause());
+            } catch (final IOException e) {
+                result = new Result.NetworkFailure<>(e);
+            }
+            return result;
+        }
+    }
+
+    private static final class CompleteMultipartUploadOperation implements S3Operation<Void> {
+        private final S3Client client;
+        private final String key;
+        private final String uploadId;
+        private final byte[] requestBody;
+
+        CompleteMultipartUploadOperation(
+                final S3Client client, final String key, final String uploadId, final byte[] requestBody) {
+            this.client = client;
+            this.key = key;
+            this.uploadId = uploadId;
+            this.requestBody = requestBody;
+        }
+
+        @Override
+        public Result<Void> execute() {
+            Result<Void> result;
+            try {
+                final Map<String, String> headers = new HashMap<>();
+                headers.put("content-type", "application/xml");
+                final String url = client.endpoint + client.bucketName + "/" + key + "?" + "uploadId=" + uploadId;
+                final HttpResponse<InputStream> response =
+                        client.request(url, POST, headers, requestBody, BodyHandlers.ofInputStream());
+                final int responseStatusCode = response.statusCode();
+                try (final InputStream in = response.body()) {
+                    if (responseStatusCode != 200) {
+                        final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
+                        final HttpHeaders responseHeaders = response.headers();
+                        final String message =
+                                "Failed to complete multipart upload: key=%s, uploadId=%s".formatted(key, uploadId);
+                        result = new Result.ResponseFailure<>(
+                                responseStatusCode, responseBody, responseHeaders, message);
+                    } else {
+                        result = new Result.Success<>(null);
+                    }
+                }
+            } catch (final UncheckedIOException e) {
+                result = new Result.NetworkFailure<>(e.getCause());
+            } catch (final IOException e) {
+                result = new Result.NetworkFailure<>(e);
+            }
+            return result;
+        }
+    }
+
+    private static final class ListPartsOperation implements S3Operation<List<PartInfo>> {
+        private final S3Client client;
+        private final String key;
+        private final String uploadId;
+
+        ListPartsOperation(final S3Client client, final String key, final String uploadId) {
+            this.client = client;
+            this.key = key;
+            this.uploadId = uploadId;
+        }
+
+        @Override
+        public Result<List<PartInfo>> execute() {
+            Result<List<PartInfo>> result;
+            try {
+                final String canonicalQueryString = "max-parts=1000&uploadId=" + uploadId;
+                final String url =
+                        client.endpoint + client.bucketName + "/" + urlEncode(key, true) + "?" + canonicalQueryString;
+                final HttpResponse<InputStream> response =
+                        client.request(url, GET, Collections.emptyMap(), null, BodyHandlers.ofInputStream());
+                final int responseStatusCode = response.statusCode();
+                try (final InputStream in = response.body()) {
+                    if (responseStatusCode != 200) {
+                        final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
+                        final HttpHeaders responseHeaders = response.headers();
+                        final String message = "Failed to list parts: key=%s, uploadId=%s".formatted(key, uploadId);
+                        result = new Result.ResponseFailure<>(
+                                responseStatusCode, responseBody, responseHeaders, message);
+                    } else {
+                        final SortedMap<Integer, PartInfo> parts = new ConcurrentSkipListMap<>();
+                        final NodeList partNodes = client.parseDocument(in).getElementsByTagName("Part");
+                        for (int i = 0; i < partNodes.getLength(); i++) {
+                            final Element part = (Element) partNodes.item(i);
+                            final int partNumber = Integer.parseInt(part.getElementsByTagName("PartNumber")
+                                    .item(0)
+                                    .getTextContent());
+                            final long size = Long.parseLong(
+                                    part.getElementsByTagName("Size").item(0).getTextContent());
+                            final String etag =
+                                    part.getElementsByTagName("ETag").item(0).getTextContent();
+                            parts.put(partNumber, new PartInfo(partNumber, size, etag));
+                        }
+                        result = new Result.Success<>(parts.values().stream().toList());
+                    }
+                }
+            } catch (final UncheckedIOException e) {
+                result = new Result.NetworkFailure<>(e.getCause());
+            } catch (final IOException e) {
+                result = new Result.NetworkFailure<>(e);
+            }
+            return result;
+        }
+    }
+
+    private static final class UploadPartCopyOperation implements S3Operation<String> {
+        private final S3Client client;
+        private final String sourceKey;
+        private final long startByte;
+        private final long endByte;
+        private final String destKey;
+        private final String uploadId;
+        private final int partNumber;
+
+        UploadPartCopyOperation(
+                final S3Client client,
+                final String sourceKey,
+                final long startByte,
+                final long endByte,
+                final String destKey,
+                final String uploadId,
+                final int partNumber) {
+            this.client = client;
+            this.sourceKey = sourceKey;
+            this.startByte = startByte;
+            this.endByte = endByte;
+            this.destKey = destKey;
+            this.uploadId = uploadId;
+            this.partNumber = partNumber;
+        }
+
+        @Override
+        public Result<String> execute() {
+            Result<String> result;
+            try {
+                final String canonicalQueryString = "partNumber=" + partNumber + "&uploadId=" + uploadId;
+                final Map<String, String> headers = new HashMap<>();
+                headers.put("x-amz-copy-source", "/" + client.bucketName + "/" + urlEncode(sourceKey, true));
+                headers.put("x-amz-copy-source-range", "bytes=" + startByte + "-" + endByte);
+                final String url = client.endpoint + client.bucketName + "/" + urlEncode(destKey, true) + "?"
+                        + canonicalQueryString;
+                final HttpResponse<InputStream> response =
+                        client.request(url, PUT, headers, null, BodyHandlers.ofInputStream());
+                final int responseStatusCode = response.statusCode();
+                try (final InputStream in = response.body()) {
+                    if (responseStatusCode != 200) {
+                        final byte[] responseBody = in.readNBytes(ERROR_BODY_MAX_LENGTH);
+                        final HttpHeaders responseHeaders = response.headers();
+                        final String message =
+                                "Failed to copy part: sourceKey=%s, destKey=%s, uploadId=%s, partNumber=%d"
+                                        .formatted(sourceKey, destKey, uploadId, partNumber);
+                        result = new Result.ResponseFailure<>(
+                                responseStatusCode, responseBody, responseHeaders, message);
+                    } else {
+                        result = new Result.Success<>(client.parseDocument(in)
+                                .getElementsByTagName("ETag")
+                                .item(0)
+                                .getTextContent());
+                    }
+                }
+            } catch (final UncheckedIOException e) {
+                result = new Result.NetworkFailure<>(e.getCause());
+            } catch (final IOException e) {
+                result = new Result.NetworkFailure<>(e);
+            }
+            return result;
+        }
+    }
+
+    private static final class DownloadObjectRangeOperation implements S3Operation<byte[]> {
+        private final S3Client client;
+        private final String key;
+        private final long startByte;
+        private final long endByte;
+
+        DownloadObjectRangeOperation(
+                final S3Client client, final String key, final long startByte, final long endByte) {
+            this.client = client;
+            this.key = key;
+            this.startByte = startByte;
+            this.endByte = endByte;
+        }
+
+        @Override
+        public Result<byte[]> execute() {
+            Result<byte[]> result;
+            try {
+                final Map<String, String> headers = new HashMap<>();
+                headers.put("Range", "bytes=" + startByte + "-" + endByte);
+                final String url = client.endpoint + client.bucketName + "/" + urlEncode(key, true);
+                final HttpResponse<byte[]> response =
+                        client.request(url, GET, headers, null, BodyHandlers.ofByteArray());
+                final int responseStatusCode = response.statusCode();
+                if (responseStatusCode == 206 || responseStatusCode == 200) {
+                    result = new Result.Success<>(response.body());
+                } else {
+                    final String message =
+                            "Failed to download object range: key=%s, range=%d-%d".formatted(key, startByte, endByte);
+                    result = new Result.ResponseFailure<>(
+                            responseStatusCode, response.body(), response.headers(), message);
+                }
+            } catch (final UncheckedIOException e) {
+                result = new Result.NetworkFailure<>(e.getCause());
+            }
+            return result;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // HTTP layer
+    // -------------------------------------------------------------------------
 
     /**
      * Performs an HTTP request to S3 to the specified URL with the given parameters.
@@ -847,6 +1395,9 @@ public final class S3Client implements AutoCloseable {
             requestBuilder = requestBuilder.headers(localHeaders.entrySet().stream()
                     .flatMap(entry -> Stream.of(entry.getKey(), entry.getValue()))
                     .toArray(String[]::new));
+            if (retryPolicy.requestTimeoutMs() > 0) {
+                requestBuilder = requestBuilder.timeout(Duration.ofMillis(retryPolicy.requestTimeoutMs()));
+            }
             final HttpRequest request = requestBuilder.build();
             return httpClient.send(request, bodyHandler);
         } catch (final IOException e) {
@@ -1069,7 +1620,7 @@ public final class S3Client implements AutoCloseable {
     private Document parseDocument(final InputStream is) {
         try {
             return documentBuilderFactory.newDocumentBuilder().parse(is);
-        } catch (final Exception e) {
+        } catch (final SAXException | ParserConfigurationException | IOException e) {
             throw new UncheckedIOException(new IOException(e));
         }
     }
