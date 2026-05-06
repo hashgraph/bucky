@@ -567,6 +567,65 @@ public class S3ClientTest {
     }
 
     // -----------------------------------------------------------------------
+    // removeObject — input validation
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#deleteObject(String)} throws
+     * {@link IllegalArgumentException} for a blank key.
+     */
+    @Test
+    @DisplayName("removeObject() throws IllegalArgumentException for a blank key")
+    void testDeleteObjectRejectsBlankKey() throws S3ClientInitializationException {
+        try (final S3Client s3Client = client()) {
+            assertThatThrownBy(() -> s3Client.deleteObject("")).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.deleteObject("   ")).isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // removeObject — integration
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#deleteObject(String)} successfully removes
+     * an existing object so that it is no longer present in the bucket.
+     */
+    @Test
+    @DisplayName("removeObject() removes an existing object from the bucket")
+    void testDeleteObjectDeletesExistingObject() throws Exception {
+        final String key = "testRemoveObjectExisting.txt";
+        final String content = "to be removed";
+        minioClient.putObject(PutObjectArgs.builder().bucket(BUCKET_NAME).object(key).stream(
+                        new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8)), content.length(), -1)
+                .build());
+        try (final S3Client s3Client = client()) {
+            assertDoesNotThrow(() -> s3Client.deleteObject(key));
+        }
+        final boolean stillExists = minioClient
+                .listObjects(ListObjectsArgs.builder()
+                        .bucket(BUCKET_NAME)
+                        .prefix(key)
+                        .maxKeys(1)
+                        .build())
+                .iterator()
+                .hasNext();
+        assertThat(stillExists).isFalse();
+    }
+
+    /**
+     * Verifies that {@link S3Client#deleteObject(String)} does not throw when
+     * called with a key that does not exist in the bucket (S3 DELETE is idempotent).
+     */
+    @Test
+    @DisplayName("removeObject() does not throw for a non-existent key")
+    void testDeleteObjectOnNonExistentKeyDoesNotThrow() throws S3ClientInitializationException {
+        try (final S3Client s3Client = client()) {
+            assertDoesNotThrow(() -> s3Client.deleteObject("non-existent-object-to-remove.txt"));
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // listObjects — boundary and integration
     // -----------------------------------------------------------------------
 
@@ -633,6 +692,397 @@ public class S3ClientTest {
             assertDoesNotThrow(() -> s3Client.uploadTextFile(key, "STANDARD", expected));
             final String actual = s3Client.downloadTextFile(key);
             assertThat(actual).isEqualTo(expected);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // listParts — input validation
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#listParts(String, String)} throws
+     * {@link IllegalArgumentException} for a blank key.
+     */
+    @Test
+    @DisplayName("listParts() throws IllegalArgumentException for a blank key")
+    void testListPartsRejectsBlankKey() throws S3ClientInitializationException {
+        try (final S3Client s3Client = client()) {
+            assertThatThrownBy(() -> s3Client.listParts("", "some-upload-id"))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.listParts("  ", "some-upload-id"))
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    /**
+     * Verifies that {@link S3Client#listParts(String, String)} throws
+     * {@link IllegalArgumentException} for a blank upload ID.
+     */
+    @Test
+    @DisplayName("listParts() throws IllegalArgumentException for a blank uploadId")
+    void testListPartsRejectsBlankUploadId() throws S3ClientInitializationException {
+        try (final S3Client s3Client = client()) {
+            assertThatThrownBy(() -> s3Client.listParts("some-key", "")).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.listParts("some-key", "  ")).isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // listParts — integration
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#listParts(String, String)} returns an empty
+     * list when no parts have been uploaded for the in-progress multipart upload.
+     */
+    @Test
+    @DisplayName("listParts() returns an empty list when no parts have been uploaded")
+    void testListPartsReturnsEmptyWhenNoPartsUploaded() throws Exception {
+        final String key = "testListPartsEmpty.txt";
+        try (final S3Client s3Client = client()) {
+            final String uploadId = s3Client.createMultipartUpload(key, "STANDARD", "plain/text");
+            try {
+                final List<S3Client.PartInfo> parts = s3Client.listParts(key, uploadId);
+                assertThat(parts).isNotNull().isEmpty();
+            } finally {
+                s3Client.abortMultipartUpload(key, uploadId);
+            }
+        }
+    }
+
+    /**
+     * Verifies that {@link S3Client#listParts(String, String)} returns all
+     * uploaded parts and that they are sorted by part number even when uploaded
+     * out of order.
+     */
+    @Test
+    @DisplayName("listParts() returns uploaded parts sorted by part number")
+    void testListPartsReturnsUploadedPartsSortedByPartNumber() throws Exception {
+        final String key = "testListPartsSorted.txt";
+        // Part size is only validated at completion; use small data since we abort before completing.
+        final byte[] part1Data = "part-one".getBytes(StandardCharsets.UTF_8);
+        final byte[] part2Data = "part-two".getBytes(StandardCharsets.UTF_8);
+        try (final S3Client s3Client = client()) {
+            final String uploadId = s3Client.createMultipartUpload(key, "STANDARD", "plain/text");
+            try {
+                // Upload in reverse order to confirm the result is sorted by part number.
+                s3Client.multipartUploadPart(key, uploadId, 2, part2Data);
+                s3Client.multipartUploadPart(key, uploadId, 1, part1Data);
+                final List<S3Client.PartInfo> parts = s3Client.listParts(key, uploadId);
+                assertThat(parts).hasSize(2);
+                assertThat(parts.get(0).partNumber()).isEqualTo(1);
+                assertThat(parts.get(0).size()).isEqualTo(part1Data.length);
+                assertThat(parts.get(0).etag()).isNotBlank();
+                assertThat(parts.get(1).partNumber()).isEqualTo(2);
+                assertThat(parts.get(1).size()).isEqualTo(part2Data.length);
+                assertThat(parts.get(1).etag()).isNotBlank();
+            } finally {
+                s3Client.abortMultipartUpload(key, uploadId);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // uploadPartCopy — input validation
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#uploadPartCopy} throws
+     * {@link IllegalArgumentException} for a blank source key, dest key, or upload ID.
+     */
+    @Test
+    @DisplayName("uploadPartCopy() throws IllegalArgumentException for blank parameters")
+    void testUploadPartCopyRejectsBlankParameters() throws S3ClientInitializationException {
+        try (final S3Client s3Client = client()) {
+            assertThatThrownBy(() -> s3Client.uploadPartCopy("", 0, 9, "destKey", "upload-id", 1))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.uploadPartCopy("srcKey", 0, 9, "", "upload-id", 1))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.uploadPartCopy("srcKey", 0, 9, "destKey", "", 1))
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // uploadPartCopy — integration
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#uploadPartCopy} performs a server-side byte-range
+     * copy from an existing object into a multipart upload part, and that the resulting
+     * completed object contains exactly the copied bytes.
+     */
+    @Test
+    @DisplayName("uploadPartCopy() copies a byte range from an existing object into a new object")
+    void testUploadPartCopyCopiesRangeIntoNewObject() throws Exception {
+        final String sourceKey = "testUploadPartCopySource.txt";
+        final String destKey = "testUploadPartCopyDest.txt";
+        final byte[] sourceContent = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".getBytes(StandardCharsets.UTF_8);
+        minioClient.putObject(PutObjectArgs.builder().bucket(BUCKET_NAME).object(sourceKey).stream(
+                        new ByteArrayInputStream(sourceContent), sourceContent.length, -1)
+                .build());
+        try (final S3Client s3Client = client()) {
+            // Copy bytes 5–9 inclusive ("FGHIJ") as the only part of a new multipart upload.
+            final String uploadId = s3Client.createMultipartUpload(destKey, "STANDARD", "plain/text");
+            final String etag = s3Client.uploadPartCopy(sourceKey, 5, 9, destKey, uploadId, 1);
+            assertThat(etag).isNotBlank();
+            s3Client.completeMultipartUpload(destKey, uploadId, List.of(etag));
+        }
+        final byte[] actual = minioClient
+                .getObject(GetObjectArgs.builder()
+                        .bucket(BUCKET_NAME)
+                        .object(destKey)
+                        .build())
+                .readAllBytes();
+        assertThat(actual).isEqualTo("FGHIJ".getBytes(StandardCharsets.UTF_8));
+    }
+
+    // -----------------------------------------------------------------------
+    // downloadObjectRange — input validation
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#downloadObjectRange(String, long, long)} throws
+     * {@link IllegalArgumentException} for a blank key.
+     */
+    @Test
+    @DisplayName("downloadObjectRange() throws IllegalArgumentException for a blank key")
+    void testDownloadObjectRangeRejectsBlankKey() throws S3ClientInitializationException {
+        try (final S3Client s3Client = client()) {
+            assertThatThrownBy(() -> s3Client.downloadObjectRange("", 0, 9))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.downloadObjectRange("  ", 0, 9))
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // downloadObjectRange — integration
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#downloadObjectRange(String, long, long)} returns
+     * the correct byte slice of an existing object.
+     */
+    @Test
+    @DisplayName("downloadObjectRange() returns the expected bytes for a given range")
+    void testDownloadObjectRangeReturnsExpectedBytes() throws Exception {
+        final String key = "testDownloadObjectRange.txt";
+        final byte[] content = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".getBytes(StandardCharsets.UTF_8);
+        minioClient.putObject(PutObjectArgs.builder().bucket(BUCKET_NAME).object(key).stream(
+                        new ByteArrayInputStream(content), content.length, -1)
+                .build());
+        try (final S3Client s3Client = client()) {
+            // bytes 2–6 inclusive = 'C','D','E','F','G'
+            final byte[] actual = s3Client.downloadObjectRange(key, 2, 6);
+            assertThat(actual).isEqualTo("CDEFG".getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    /**
+     * Verifies that {@link S3Client#downloadObjectRange(String, long, long)} throws
+     * {@link S3ResponseException} when the requested object does not exist.
+     */
+    @Test
+    @DisplayName("downloadObjectRange() throws S3ResponseException for a non-existent object")
+    void testDownloadObjectRangeThrowsForNonExistentObject() throws S3ClientInitializationException {
+        try (final S3Client s3Client = client()) {
+            assertThatThrownBy(() -> s3Client.downloadObjectRange("non-existent-range-object.txt", 0, 9))
+                    .isInstanceOf(S3ResponseException.class);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // listObjectsPage — input validation (no network calls required)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#listObjectsPage(String, String, String, int)} throws
+     * {@link NullPointerException} when {@code prefix} is {@code null}.
+     */
+    @Test
+    @DisplayName("listObjectsPage() throws NullPointerException for a null prefix")
+    void testListObjectsPageRejectsNullPrefix() throws S3ClientInitializationException {
+        try (final S3Client s3Client = client()) {
+            assertThatThrownBy(() -> s3Client.listObjectsPage(null, null, null, 10))
+                    .isInstanceOf(NullPointerException.class);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // listObjectsPage — integration
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#listObjectsPage(String, String, String, int)} returns
+     * an empty key list and a {@code null} continuation token when no objects
+     * match the given prefix.
+     */
+    @Test
+    @DisplayName("listObjectsPage() returns an empty page when no objects match the prefix")
+    void testListObjectsPageReturnsEmptyPageForNonExistentPrefix() throws Exception {
+        try (final S3Client s3Client = client()) {
+            final S3Client.ListPage page = s3Client.listObjectsPage("no-such-prefix-xyz-", null, null, 100);
+            assertThat(page).isNotNull();
+            assertThat(page.keys()).isNotNull().isEmpty();
+            assertThat(page.continuationToken()).isNull();
+        }
+    }
+
+    /**
+     * Verifies that {@link S3Client#listObjectsPage(String, String, String, int)} returns
+     * all matching keys and a {@code null} continuation token when the total
+     * number of objects fits within a single page.
+     */
+    @Test
+    @DisplayName("listObjectsPage() returns all keys and no continuation token when results fit on one page")
+    void testListObjectsPageReturnsSinglePageWithNoContinuationToken() throws Exception {
+        final String keyPrefix = "page-single-";
+        final String content = "single page content";
+        final List<String> expected = List.of(keyPrefix + "a.txt", keyPrefix + "b.txt", keyPrefix + "c.txt");
+        for (final String key : expected) {
+            minioClient.putObject(PutObjectArgs.builder().bucket(BUCKET_NAME).object(key).stream(
+                            new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8)), content.length(), -1)
+                    .build());
+        }
+        try (final S3Client s3Client = client()) {
+            final S3Client.ListPage page = s3Client.listObjectsPage(keyPrefix, null, null, 100);
+            assertThat(page.keys()).containsExactlyInAnyOrderElementsOf(expected);
+            assertThat(page.continuationToken()).isNull();
+        }
+    }
+
+    /**
+     * Verifies that {@link S3Client#listObjectsPage(String, String, String, int)} returns
+     * a non-null continuation token when {@code maxResults} is smaller than the
+     * total number of matching objects, indicating more pages are available.
+     */
+    @Test
+    @DisplayName("listObjectsPage() returns a continuation token when there are more results beyond the page")
+    void testListObjectsPageReturnsContinuationTokenWhenMoreResultsExist() throws Exception {
+        final String keyPrefix = "page-overflow-";
+        final String content = "overflow content";
+        final List<String> uploaded = List.of(keyPrefix + "1.txt", keyPrefix + "2.txt", keyPrefix + "3.txt");
+        for (final String key : uploaded) {
+            minioClient.putObject(PutObjectArgs.builder().bucket(BUCKET_NAME).object(key).stream(
+                            new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8)), content.length(), -1)
+                    .build());
+        }
+        try (final S3Client s3Client = client()) {
+            // Request fewer results than the number of uploaded objects.
+            final S3Client.ListPage page = s3Client.listObjectsPage(keyPrefix, null, null, 1);
+            assertThat(page.keys()).hasSize(1);
+            assertThat(page.continuationToken()).isNotNull().isNotBlank();
+        }
+    }
+
+    /**
+     * Verifies that passing a continuation token from a previous call to
+     * {@link S3Client#listObjectsPage(String, String, String, int)} returns the next page
+     * of results, and that all pages together contain every uploaded object exactly once.
+     */
+    @Test
+    @DisplayName("listObjectsPage() paginates correctly using continuation tokens")
+    void testListObjectsPagePaginationReturnsAllObjectsAcrossPages() throws Exception {
+        final String keyPrefix = "page-paginate-";
+        final String content = "paginate content";
+        final List<String> uploaded = List.of(
+                keyPrefix + "1.txt",
+                keyPrefix + "2.txt",
+                keyPrefix + "3.txt",
+                keyPrefix + "4.txt",
+                keyPrefix + "5.txt");
+        for (final String key : uploaded) {
+            minioClient.putObject(PutObjectArgs.builder().bucket(BUCKET_NAME).object(key).stream(
+                            new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8)), content.length(), -1)
+                    .build());
+        }
+        try (final S3Client s3Client = client()) {
+            final List<String> accumulated = new ArrayList<>();
+            String token = null;
+            do {
+                final S3Client.ListPage page = s3Client.listObjectsPage(keyPrefix, token, null, 2);
+                assertThat(page.keys()).isNotEmpty();
+                accumulated.addAll(page.keys());
+                token = page.continuationToken();
+            } while (token != null);
+            assertThat(accumulated).containsExactlyInAnyOrderElementsOf(uploaded);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // listObjectsPage — delimiter tests
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that {@link S3Client#listObjectsPage(String, String, String, int)} with a
+     * delimiter returns common prefixes (virtual directories) instead of individual keys.
+     * Objects under {@code dir1/} and {@code dir2/} should be grouped as two common prefixes.
+     */
+    @Test
+    @DisplayName("listObjectsPage() with delimiter returns common prefixes instead of flat keys")
+    void testListObjectsPageWithDelimiterReturnsCommonPrefixes() throws Exception {
+        final String keyPrefix = "delim-dirs-";
+        final String content = "delimiter content";
+        // Upload objects spread across two virtual directories.
+        final List<String> uploaded =
+                List.of(keyPrefix + "dir1/file-a.txt", keyPrefix + "dir1/file-b.txt", keyPrefix + "dir2/file-c.txt");
+        for (final String key : uploaded) {
+            minioClient.putObject(PutObjectArgs.builder().bucket(BUCKET_NAME).object(key).stream(
+                            new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8)), content.length(), -1)
+                    .build());
+        }
+        try (final S3Client s3Client = client()) {
+            final S3Client.ListPage page = s3Client.listObjectsPage(keyPrefix, null, "/", 100);
+            // Should return the two common prefixes, not the individual file keys.
+            assertThat(page.keys()).containsExactlyInAnyOrder(keyPrefix + "dir1/", keyPrefix + "dir2/");
+            assertThat(page.continuationToken()).isNull();
+        }
+    }
+
+    /**
+     * Verifies that {@link S3Client#listObjectsPage(String, String, String, int)} with a
+     * delimiter returns an empty list when no objects match the given prefix.
+     */
+    @Test
+    @DisplayName("listObjectsPage() with delimiter returns empty page for non-existent prefix")
+    void testListObjectsPageWithDelimiterReturnsEmptyPageForNonExistentPrefix() throws Exception {
+        try (final S3Client s3Client = client()) {
+            final S3Client.ListPage page = s3Client.listObjectsPage("no-such-delim-prefix-xyz-", null, "/", 100);
+            assertThat(page.keys()).isNotNull().isEmpty();
+            assertThat(page.continuationToken()).isNull();
+        }
+    }
+
+    /**
+     * Verifies that {@link S3Client#listObjectsPage(String, String, String, int)} with a
+     * delimiter correctly pages through common prefixes when there are more than
+     * {@code maxResults} virtual directories.
+     */
+    @Test
+    @DisplayName("listObjectsPage() with delimiter paginates common prefixes correctly")
+    void testListObjectsPageWithDelimiterPaginatesCommonPrefixes() throws Exception {
+        final String keyPrefix = "delim-page-";
+        final String content = "delimiter page content";
+        // Create three virtual directories, each with one object.
+        final List<String> uploaded =
+                List.of(keyPrefix + "alpha/file.txt", keyPrefix + "beta/file.txt", keyPrefix + "gamma/file.txt");
+        for (final String key : uploaded) {
+            minioClient.putObject(PutObjectArgs.builder().bucket(BUCKET_NAME).object(key).stream(
+                            new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8)), content.length(), -1)
+                    .build());
+        }
+        try (final S3Client s3Client = client()) {
+            final List<String> accumulated = new ArrayList<>();
+            String token = null;
+            do {
+                final S3Client.ListPage page = s3Client.listObjectsPage(keyPrefix, token, "/", 1);
+                assertThat(page.keys()).hasSize(1);
+                accumulated.addAll(page.keys());
+                token = page.continuationToken();
+            } while (token != null);
+            assertThat(accumulated)
+                    .containsExactlyInAnyOrder(keyPrefix + "alpha/", keyPrefix + "beta/", keyPrefix + "gamma/");
         }
     }
 
