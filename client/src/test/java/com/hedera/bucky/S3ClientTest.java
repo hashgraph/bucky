@@ -13,6 +13,7 @@ import io.minio.MakeBucketArgs;
 import io.minio.MinioClient;
 import io.minio.PutObjectArgs;
 import java.io.ByteArrayInputStream;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -463,6 +464,44 @@ public class S3ClientTest {
         }
     }
 
+    /**
+     * This test aims to verify that the {@link S3Client#openObjectStream(String)}
+     * method returns an InputStream whose content matches the uploaded object.
+     */
+    @Test
+    @DisplayName("openObjectStream() returns an InputStream with the correct content")
+    void testOpenObjectStream() throws Exception {
+        // Setup
+        final String key = "openObjectStreamTest.bin";
+        final Random random = new Random(98765432101234L);
+        final byte[] expected = new byte[2 * 1024 * 1024 + 137];
+        random.nextBytes(expected);
+        minioClient.putObject(PutObjectArgs.builder().bucket(BUCKET_NAME).object(key).stream(
+                        new ByteArrayInputStream(expected), expected.length, -1)
+                .build());
+        try (final S3Client s3Client = client()) {
+            // Call
+            try (final InputStream stream = s3Client.openObjectStream(key)) {
+                // Assert
+                assertThat(stream).isNotNull();
+                final byte[] actual = stream.readAllBytes();
+                assertThat(actual).isEqualTo(expected);
+            }
+        }
+    }
+
+    /**
+     * This test aims to verify that the {@link S3Client#openObjectStream(String)}
+     * method returns null when trying to open a stream for a non-existent object.
+     */
+    @Test
+    @DisplayName("openObjectStream() returns null for a non-existent key")
+    void testOpenObjectStreamNonExistentObject() throws Exception {
+        try (final S3Client s3Client = client()) {
+            assertNull(s3Client.openObjectStream("non-existent-stream-object.txt"));
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Constructor — precondition validation (no network calls required)
     // -----------------------------------------------------------------------
@@ -548,6 +587,19 @@ public class S3ClientTest {
         try (final S3Client s3Client = client()) {
             assertThatThrownBy(() -> s3Client.downloadTextFile("")).isInstanceOf(IllegalArgumentException.class);
             assertThatThrownBy(() -> s3Client.downloadTextFile("   ")).isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    /**
+     * Verifies that {@link S3Client#openObjectStream(String)} throws
+     * {@link IllegalArgumentException} for a blank key.
+     */
+    @Test
+    @DisplayName("openObjectStream() throws IllegalArgumentException for a blank key")
+    void testOpenObjectStreamRejectsBlankKey() throws S3ClientInitializationException {
+        try (final S3Client s3Client = client()) {
+            assertThatThrownBy(() -> s3Client.openObjectStream("")).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> s3Client.openObjectStream("   ")).isInstanceOf(IllegalArgumentException.class);
         }
     }
 
